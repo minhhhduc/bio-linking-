@@ -274,6 +274,35 @@ the caller; the schema carries no definitions) + mention/context; it must not
 touch the index. It returns a CUI from the candidate list or raises
 `RerankError`.
 
+```python
+def select_with_fallback(reranker, mention, context, candidates,
+                         concept_names=None) -> tuple[str, str | None]
+    # (cui, error); RerankError -> first candidate's CUI, error text.
+```
+
+Shared by `EntityLinker.link` and `candidates.rerank_candidates` so the live and
+saved-candidate paths degrade identically.
+
+## candidates.py (retrieval → E2E hand-off)
+
+```python
+FORMAT = "grf-candidates-v1"
+def save_candidates(path, samples, responses) -> None
+def load_candidates(path) -> tuple[list[MentionSample], list[Response]]
+def rerank_candidates(samples, responses, *, reranker, concept_names=None,
+                      progress_callback=None) -> list[Response]
+```
+
+One JSONL record per mention: format tag, sample fields (mention, context,
+gold CUI, label, token spans, record/entity indices), retrieval `cui`,
+`candidates`, the untruncated `concept_ranking`, `score_kind` and `error`.
+`load_candidates` validates the sample and candidate fields (the optional
+`score_kind`/`error` values pass through) and reconstructs
+`Response.debug["concept_ranking"]`, so `metrics_from_responses` can compute
+R@1/R@5 without re-running retrieval. `rerank_candidates` applies
+`select_with_fallback` and reports progress; it never loads the encoder or the
+vector index.
+
 ## pipeline.py + evaluator.py + cli.py
 
 ```python
@@ -288,8 +317,14 @@ class Metrics: n, recall_at_1, recall_at_5, accuracy
 def evaluate(linker, samples) -> Metrics
 def evaluate_all(linker, samples, *, progress_callback=None
                  ) -> tuple[Metrics, dict[str | None, Metrics]]
+def metrics_from_responses(samples, responses
+                           ) -> tuple[Metrics, dict[str | None, Metrics]]
 def evaluate_by_label(linker, samples) -> dict[str | None, Metrics]
 ```
+
+`metrics_from_responses` computes the same overall/per-label metrics from
+already-computed responses; `evaluate_all` delegates to it after one
+`link_batch` pass, and the retrieval/E2E notebooks use it directly.
 
 Pipeline 1: fuse Q0 + Q_F (weights 1/(n+1)) -> one index scan
 (`top_k_retrieval`) -> max aggregation -> `top_k_concept` -> rerank.

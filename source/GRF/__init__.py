@@ -7,6 +7,7 @@ package needs only numpy.
 """
 
 from .aggregation import aggregate_hits, concept_rank_list
+from .candidates import load_candidates, rerank_candidates, save_candidates
 from .config import (
     FEEDBACK_KINDS,
     FUSION_KINDS,
@@ -22,7 +23,14 @@ from .data import (
     load_bel_jsonl,
 )
 from .encoder import Encoder, SentenceTransformerEncoder, build_encoder
-from .evaluator import Metrics, evaluate, evaluate_all, evaluate_by_label, make_requests
+from .evaluator import (
+    Metrics,
+    evaluate,
+    evaluate_all,
+    evaluate_by_label,
+    make_requests,
+    metrics_from_responses,
+)
 from .feedback import (
     FeedbackGenerator,
     InMemoryFeedbackCache,
@@ -35,7 +43,13 @@ from .index import VectorIndex
 from .kb import concepts_from_dataset, load_concepts_jsonl, surface_entries
 from .llm import LLMClient, LLMError, OpenAICompatibleClient
 from .pipeline import EntityLinker
-from .rerank import LLMReranker, PickTopOne, RerankError, Reranker
+from .rerank import (
+    LLMReranker,
+    PickTopOne,
+    RerankError,
+    Reranker,
+    select_with_fallback,
+)
 from .schemas import (
     Candidate,
     Concept,
@@ -89,9 +103,14 @@ __all__ = [
     "evaluate_by_label",
     "interpolate_vectors",
     "load_bel_jsonl",
+    "load_candidates",
     "load_concepts_jsonl",
     "make_requests",
+    "metrics_from_responses",
     "parse_synonyms",
+    "rerank_candidates",
     "rrf_scores",
+    "save_candidates",
+    "select_with_fallback",
     "surface_entries",
 ]

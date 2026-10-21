@@ -129,8 +129,8 @@ the stale claims.
 - **Scale and cache bounds:** retrieval is an exact cosine scan; the feedback
   cache is an unbounded in-process dictionary. Both are acceptable for the
   reference-scale experiments but are not a production retrieval design.
-- **No runtime validation:** behavior is reasoned statically. Tests are
-  written but were not run; no empirical or table results are claimed.
+- **No runtime validation:** behavior is reasoned statically. No tests are
+  shipped; no empirical or table results are claimed.
 - **Outstanding integration/data audit:** the dedicated integration/data
   auditor produced no report. Integration and data correctness beyond the
   checks listed in this record remain unverified by that independent pass.

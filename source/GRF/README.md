@@ -19,6 +19,7 @@ results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 | C8 | Pick Top-1 / LLM re-ranker (no index access) | `rerank.py` | §8 |
 | C9 | R@1, R@5, end-to-end accuracy | `evaluator.py` | §10 |
 | — | Pipeline 1/2 orchestration | `pipeline.py` | §5.2, §5.3 |
+| — | Candidate snapshot (retrieval → E2E hand-off) | `candidates.py` | §10 |
 
 ## Method equations implemented
 
@@ -154,8 +155,14 @@ the untruncated concept ranking, so `top_k_concept` no longer caps it; keep
 
 ## Notebooks
 
-No tests are shipped. The pipeline has never been executed. Colab notebooks live in
-[`source/notebooks/GRF/`](../notebooks/GRF/): `build_KB.ipynb` embeds the KB
-JSONL from Google Drive into the single-file artifact; `run.ipynb` loads that
-artifact, the same KB JSONL (for preferred names) and the gold data from Drive,
-then links/evaluates.
+No tests are shipped. The pipeline has never been executed. Colab notebooks live
+in [`source/notebooks/GRF/`](../notebooks/GRF/):
+
+- `build_KB.ipynb` embeds the KB JSONL from Google Drive into the single-file
+  artifact.
+- `retrieval.ipynb` loads the KB data, the artifact and the gold data from
+  Drive, runs candidate retrieval, reports R@1/R@5, and saves every mention's
+  candidates to one JSONL file (`candidates.save_candidates`).
+- `e2e.ipynb` reads only that candidate file, applies Top-1 or the LLM
+  re-ranker (`candidates.rerank_candidates`), and reports end-to-end accuracy;
+  it never loads the encoder, the index or the KB artifact.

@@ -113,6 +113,41 @@ def _metrics(samples: Sequence[MentionSample], responses: Sequence[Response]) ->
     )
 
 
+def metrics_from_responses(
+    samples: Iterable[MentionSample],
+    responses: Iterable[Response],
+) -> tuple[Metrics, dict[str | None, Metrics]]:
+    """Overall and per-label metrics for already-computed responses.
+
+    Used by the retrieval notebook (metrics after one ``link_batch``) and by
+    the end-to-end notebook (metrics after re-ranking a saved candidate file).
+    """
+    sample_list = list(samples)
+    if isinstance(responses, (str, bytes)):
+        raise ValueError("responses must be a sequence of Response objects")
+    response_list = list(responses)
+    if len(sample_list) != len(response_list):
+        raise ValueError(
+            f"got {len(sample_list)} samples but {len(response_list)} responses"
+        )
+    for index, response in enumerate(response_list):
+        if not isinstance(response, Response):
+            raise ValueError(f"responses[{index}] must be a Response")
+
+    groups: dict[str | None, tuple[list[MentionSample], list[Response]]] = {}
+    for sample, response in zip(sample_list, response_list):
+        group_samples, group_responses = groups.setdefault(sample.label, ([], []))
+        group_samples.append(sample)
+        group_responses.append(response)
+
+    overall = _metrics(sample_list, response_list)
+    by_label = {
+        label: _metrics(group_samples, group_responses)
+        for label, (group_samples, group_responses) in groups.items()
+    }
+    return overall, by_label
+
+
 def _link(
     linker,
     samples: Sequence[MentionSample],
@@ -163,19 +198,7 @@ def evaluate_all(
         raise ValueError("progress_callback must be callable or None")
     sample_list = list(samples)
     responses = _link(linker, sample_list, progress_callback)
-
-    groups: dict[str | None, tuple[list[MentionSample], list[Response]]] = {}
-    for sample, response in zip(sample_list, responses):
-        group_samples, group_responses = groups.setdefault(sample.label, ([], []))
-        group_samples.append(sample)
-        group_responses.append(response)
-
-    overall = _metrics(sample_list, responses)
-    by_label = {
-        label: _metrics(group_samples, group_responses)
-        for label, (group_samples, group_responses) in groups.items()
-    }
-    return overall, by_label
+    return metrics_from_responses(sample_list, responses)
 
 
 def evaluate_by_label(

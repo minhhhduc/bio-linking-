@@ -67,6 +67,33 @@ class PickTopOne:
         return min(scored, key=lambda item: (-item[0], item[1]))[1]
 
 
+def select_with_fallback(
+    reranker: Reranker,
+    mention: str,
+    context: str,
+    candidates: Sequence[Candidate],
+    concept_names: Mapping[str, str] | None = None,
+) -> tuple[str, str | None]:
+    """Run ``reranker`` and fall back to Top-1 on ``RerankError``.
+
+    Returns ``(cui, error)``; ``error`` is ``None`` on success.  Shared by the
+    live pipeline and the end-to-end notebook that re-ranks saved candidates.
+    """
+    ordered = tuple(candidates)
+    if not ordered:
+        raise ValueError("candidates must not be empty")
+    names = concept_names if concept_names is not None else {}
+    try:
+        cui = reranker.rerank(mention, context, ordered, names)
+        if not isinstance(cui, str) or cui not in {c.cui for c in ordered}:
+            raise RerankError(
+                f"re-ranker returned {cui!r}, which is not a candidate"
+            )
+    except RerankError as exc:
+        return ordered[0].cui, str(exc)
+    return cui, None
+
+
 def _require_text(name: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string, got {value!r}")

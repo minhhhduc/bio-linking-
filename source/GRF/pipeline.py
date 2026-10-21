@@ -24,7 +24,7 @@ import numpy as np
 from .aggregation import aggregate_hits, concept_rank_list
 from .config import FEEDBACK_KINDS, N_SYN_VALUES, PipelineConfig
 from .fusion import component_weights, interpolate_vectors, rrf_scores
-from .rerank import PickTopOne, RerankError
+from .rerank import PickTopOne, select_with_fallback
 from .schemas import (
     Candidate,
     Feedback,
@@ -227,25 +227,15 @@ class EntityLinker:
             debug["error"] = "no_candidates"
             return Response(cui="", candidates=(), debug=debug)
 
-        try:
-            cui = self._reranker.rerank(
-                request.mention,
-                request.context,
-                candidates,
-                self._concept_names,
-            )
-            if (
-                not isinstance(cui, str)
-                or cui not in {candidate.cui for candidate in candidates}
-            ):
-                raise RerankError(
-                    f"re-ranker returned {cui!r}, which is not a candidate"
-                )
-        except RerankError as exc:
-            # §6 degradation principle: a failed LLM call must not sink the
-            # request.  Only the re-ranker's own error type is caught.
-            rerank_debug["error"] = str(exc)
-            cui = candidates[0].cui
+        # §6 degradation principle: a failed LLM call must not sink the request.
+        cui, rerank_error = select_with_fallback(
+            self._reranker,
+            request.mention,
+            request.context,
+            candidates,
+            self._concept_names,
+        )
+        rerank_debug["error"] = rerank_error
 
         debug["rerank"] = rerank_debug
         return Response(cui=cui, candidates=tuple(candidates), debug=debug)
