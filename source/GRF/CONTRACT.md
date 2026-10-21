@@ -4,8 +4,11 @@ Frozen interfaces for parallel implementation. Derived from
 `docs/architecture.md` and `paper/reference_abstract.md`. Do not change a
 signature here without coordinating; other modules import it.
 
-Package root: `source/GRF/`. Python 3.10+. `numpy` is the only hard
-dependency; `sentence-transformers` is imported lazily by the encoder.
+Package roots: `source/common/` (shared encoder, index, KB/gold loaders,
+candidate I/O, aggregation, metrics) and `source/GRF/` (feedback, fusion,
+re-ranking, orchestration). The GRF modules re-export the common symbols under
+their old paths. Python 3.10+. `numpy` is the only hard dependency;
+`sentence-transformers` is imported lazily by the encoder.
 
 Progress convention: every record-scanning function the notebooks run takes an
 optional `progress_callback(done, total)`; `total` may be `None` when unknown.
@@ -13,7 +16,7 @@ Callers that already counted the input pass an explicit `total` so the bar has
 a percentage. The notebooks render these callbacks with `tqdm`.
 `concepts_from_dataset` (CLI-only gold-to-KB derivation) has no callback.
 
-## schemas.py
+## common/schemas.py
 
 ```python
 @dataclass(frozen=True)
@@ -87,7 +90,7 @@ feedback kind outside `FEEDBACK_KINDS`, duplicates, `n_syn not in
 N_SYN_VALUES`, `top_k_retrieval < 1`, `top_k_concept not in 1..10`,
 empty `target_kb`/`llm_model`, `index_kb` empty string.
 
-## kb.py  (C1 + C2)
+## common/kb.py  (C1 + C2)
 
 ```python
 def load_concepts_jsonl(path, *, progress_callback=None,
@@ -115,7 +118,7 @@ concept so a rewrite cannot create a duplicate index triple.
 frequent `vi_term` per CUI (ties resolved by first appearance), aliases = the
 other observed terms, `source_kb=None`. Document leakage in its docstring.
 
-## data.py
+## common/data.py
 
 ```python
 @dataclass(frozen=True)
@@ -153,7 +156,7 @@ a `span_mismatch` issue and does **not** change the mention. `strict=True`
 raises `DataValidationError` on structural errors (bad record / missing cui /
 missing vi_term / empty context); span mismatches remain issues.
 
-## encoder.py  (C3)
+## common/encoder.py  (C3)
 
 ```python
 class Encoder(Protocol):
@@ -175,7 +178,7 @@ Lazy `import sentence_transformers` inside `__init__`; raise `RuntimeError`
 with install guidance if absent. Validate non-empty texts, 2-D output, finite
 values, non-zero norms.
 
-## index.py  (C4)
+## common/index.py  (C4)
 
 ```python
 class VectorIndex:
@@ -188,6 +191,13 @@ class VectorIndex:
         # entries: reuse a caller-computed surface_entries() expansion
     def search(self, query, top_k: int, *, source_kb: str | None = None
                ) -> list[RetrievalHit]
+    def search_batch(self, queries, top_k: int, *,
+                     source_kb: str | None = None
+                     ) -> list[list[RetrievalHit]]
+    def use_gpu(self, device: str = "cuda") -> None   # lazy torch import
+    def release_gpu(self) -> None                     # drop device copy
+    @property
+    def search_device(self) -> str                    # "cuda" | "cpu"
     def save(self, directory) -> None
     def load(self, directory) -> "VectorIndex"     # classmethod
     def save_npz(self, path) -> None                # one .npz, no pickle
@@ -197,7 +207,14 @@ class VectorIndex:
 
 Exact cosine scan (architecture permits exact). Deterministic ordering:
 score desc, then `cui`, then `surface`. Empty index -> `[]`, but query
-dimension is checked before the empty short-circuit. Save/load:
+dimension is checked before the empty short-circuit. `search_batch` scores all
+rows with one matrix multiply, chunked on the GPU to bound the transient
+`(N, queries)` score matrix. With `use_gpu()` the vectors live on CUDA and only
+the rows at or above each query's k-th score cross back to CPU for the same
+score/cui/surface tie-break. The ordering rule matches the CPU path; scores can
+differ in the last float32 ULPs because cuBLAS and BLAS reduce differently.
+PyTorch is imported lazily and stays optional; `release_gpu()` clears the device
+copy and cached CUDA memory. Save/load:
 `vectors.npy` + `meta.json` (no pickle); `encoder_info` is optional metadata
 (`{"encoder": ..., "model": ...}`) and older files without it load with
 `encoder_info=None`. Raise `ValueError` on shape/length mismatch, string passed
@@ -216,7 +233,7 @@ def rrf_scores(rank_lists, weights) -> dict[str, float]
 
 All weights sum to 1. Validate shapes, finiteness, positive ranks.
 
-## aggregation.py  (C7)
+## common/aggregation.py  (C7)
 
 ```python
 def aggregate_hits(hits, top_k_concept: int | None = None) -> list[Candidate]
@@ -294,7 +311,11 @@ def select_with_fallback(reranker, mention, context, candidates,
 Shared by `EntityLinker.link` and `candidates.rerank_candidates` so the live and
 saved-candidate paths degrade identically.
 
-## candidates.py (retrieval → E2E hand-off)
+## common/candidates.py + candidates.py (retrieval → E2E hand-off)
+
+`FORMAT`, `save_candidates` and `load_candidates` live in
+`common/candidates.py`; `GRF/candidates.py` re-exports them and adds
+`rerank_candidates` (which needs the GRF re-ranker).
 
 ```python
 FORMAT = "grf-candidates-v1"
@@ -317,6 +338,10 @@ vector index. `save_candidates`/`load_candidates` accept the same
 `progress_callback`; pass `total` when the caller already counted the records.
 
 ## pipeline.py + evaluator.py + cli.py
+
+Metric computation (`Metrics`, `metrics_from_responses`) lives in
+`common/evaluator.py`; `GRF/evaluator.py` re-exports it and adds the
+pipeline-running wrappers (`make_requests`, `evaluate`, `evaluate_all`).
 
 ```python
 class EntityLinker:
@@ -341,8 +366,8 @@ already-computed responses; `evaluate_all` delegates to it after one
 
 Pipeline 1: fuse Q0 + Q_F (weights 1/(n+1)) -> one index scan
 (`top_k_retrieval`) -> max aggregation -> `top_k_concept` -> rerank.
-Pipeline 2: one index scan per query -> concept rank lists -> weighted RRF ->
-`top_k_concept` -> rerank. `feedback_types=()` degrades to dense retrieval.
+Pipeline 2: one batched index scan (`search_batch`) over Q0 and the feedback
+queries -> concept rank lists -> weighted RRF -> `top_k_concept` -> rerank. `feedback_types=()` degrades to dense retrieval.
 If every feedback call fails, use Q0 only. If `fusion`/`rerank` are invalid
 or `rerank="llm"` without a reranker, construction raises `ValueError`. When
 `rerank != "llm"`, an injected reranker is deliberately ignored and

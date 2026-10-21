@@ -9,17 +9,22 @@ results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 
 | Arch. | Responsibility | Module | Reference |
 | --- | --- | --- | --- |
-| C1 | KB loader/parser → `Concept(cui, name, aliases)` | `kb.py` (`load_concepts_jsonl`, `concepts_from_dataset`) | §2 |
-| C2 | Homonym rewriting `a + " (" + N_c + ")"` | `kb.py` (`surface_entries`) | §3 |
-| C3 | Encoder `E(·)` (BioSyn/SapBERT) | `encoder.py` | §3, §5 |
-| C4 | Exact cosine vector index, one entry per surface form; directory (`save`/`load`) or single-file `.npz` (`save_npz`/`load_npz`) persistence | `index.py` | §3, §4.2, §5.1 |
+| C1 | KB loader/parser → `Concept(cui, name, aliases)` | `common/kb.py` (`load_concepts_jsonl`, `concepts_from_dataset`) | §2 |
+| C2 | Homonym rewriting `a + " (" + N_c + ")"` | `common/kb.py` (`surface_entries`) | §3 |
+| C3 | Encoder `E(·)` (BioSyn/SapBERT) | `common/encoder.py` | §3, §5 |
+| C4 | Exact cosine vector index, one entry per surface form; directory (`save`/`load`) or single-file `.npz` (`save_npz`/`load_npz`) persistence | `common/index.py` | §3, §4.2, §5.1 |
 | C5 | Feedback generation (`def`, `syn`, `std`) + cache + fallback | `feedback.py`, `llm.py` | §4, §6 |
 | C6 | Vector interpolation / weighted RRF | `fusion.py` | §5, §7 |
-| C7 | Concept aggregation `max` over aliases | `aggregation.py` | §7.3 |
+| C7 | Concept aggregation `max` over aliases | `common/aggregation.py` | §7.3 |
 | C8 | Pick Top-1 / LLM re-ranker (no index access) | `rerank.py` | §8 |
-| C9 | R@1, R@5, end-to-end accuracy | `evaluator.py` | §10 |
+| C9 | R@1, R@5, end-to-end accuracy | `common/evaluator.py` (metrics), `evaluator.py` (runtime) | §10 |
 | — | Pipeline 1/2 orchestration | `pipeline.py` | §5.2, §5.3 |
-| — | Candidate snapshot (retrieval → E2E hand-off) | `candidates.py` | §10 |
+| — | Candidate snapshot (retrieval → E2E hand-off) | `common/candidates.py` (I/O), `candidates.py` (re-rank) | §10 |
+
+`source/common/` has no dependency on `GRF`: it holds the encoder, vector
+index, KB/gold loaders, candidate I/O, aggregation and metrics. The GRF modules
+of the same name re-export those symbols, so existing `GRF.*` imports keep
+working. The dense baseline notebook uses `common/` only.
 
 ## Method equations implemented
 
@@ -156,17 +161,29 @@ the untruncated concept ranking, so `top_k_concept` no longer caps it; keep
 ## Notebooks
 
 No tests are shipped. The pipeline has never been executed. Colab notebooks live
-in [`source/notebooks/GRF/`](../notebooks/GRF/):
+in [`source/notebooks/GRF/`](../notebooks/GRF/), except the dense baseline,
+which is in [`source/notebooks/baseline/`](../notebooks/baseline/):
 
 - `build_KB.ipynb` embeds the KB JSONL from Google Drive into the single-file
   artifact.
 - `retrieval.ipynb` loads the KB data, the artifact and the gold data from
   Drive, runs candidate retrieval, reports R@1/R@5, and saves every mention's
   candidates to one JSONL file (`candidates.save_candidates`).
+- `baseline.ipynb` encodes each mention and scans the same artifact directly
+  (`common.encoder` + `common.index`), with no feedback, fusion or LLM. It
+  reports R@1/R@5/accuracy and writes a candidate file in the same format.
 - `e2e.ipynb` reads only that candidate file, applies Top-1 or the LLM
   re-ranker (`candidates.rerank_candidates`), and reports end-to-end accuracy;
   it never loads the encoder, the index or the KB artifact.
 
 Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
 data loading, re-ranking) drives a `tqdm` bar through the library's
-`progress_callback`; all three notebooks install `tqdm` explicitly.
+`progress_callback`; all four notebooks install `tqdm` explicitly.
+
+With `DEVICE = "cuda"`, `retrieval.ipynb` and `baseline.ipynb` keep one GPU copy of the index
+(`VectorIndex.use_gpu`) and scores queries with a batched matrix multiply; only
+rows at or above each k-th score return to CPU. If the copy does not fit, it
+logs a warning and uses the CPU scan. Each notebook ends by dropping its large
+objects (`gc.collect`); `build_KB`, `retrieval` and `baseline` also empty the
+CUDA cache (`release_gpu`, `torch.cuda.empty_cache`), while `e2e` has no GPU
+state.

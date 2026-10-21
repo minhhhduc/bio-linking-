@@ -301,21 +301,28 @@ class EntityLinker:
         if len(feedback_vectors) != len(feedback_labels):
             raise ValueError("feedback vectors and labels must have equal length")
 
-        queries: list[tuple[str, np.ndarray]] = [("Q_0", q0)]
-        queries.extend(zip(feedback_labels, feedback_vectors))
-
-        searches: list[tuple[str, list[RetrievalHit]]] = []
-        hit_debug: list[dict] = []
-        best_surface: dict[str, tuple[float, str]] = {}
-        for label, vector in queries:
-            hits = list(
+        labels = ["Q_0", *feedback_labels]
+        queries = [q0, *feedback_vectors]
+        if hasattr(self._index, "search_batch"):
+            hit_lists = self._index.search_batch(
+                queries,
+                self.config.top_k_retrieval,
+                source_kb=self.config.index_kb,
+            )
+        else:  # custom index with only search()
+            hit_lists = [
                 self._index.search(
                     vector,
                     self.config.top_k_retrieval,
                     source_kb=self.config.index_kb,
                 )
-            )
-            searches.append((label, hits))
+                for vector in queries
+            ]
+        searches = list(zip(labels, hit_lists))
+
+        hit_debug: list[dict] = []
+        best_surface: dict[str, tuple[float, str]] = {}
+        for label, hits in searches:
             for hit in hits:
                 hit_debug.append(_hit_debug(hit, label))
                 current = best_surface.get(hit.cui)

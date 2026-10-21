@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-FEEDBACK_KINDS = ("def", "syn", "std")
+from common.schemas import FEEDBACK_KINDS
+
 N_SYN_VALUES = (1, 3, 5, 10)
 FUSION_KINDS = ("vector", "rrf")
 RERANK_KINDS = ("top1", "llm")

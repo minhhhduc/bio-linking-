@@ -16,7 +16,8 @@ those mentions describe the tree at audit time.
   §4, pipelines §5, non-reproducible empirical tables §6.
 - `data/test_fixed_verified_gold_revised.jsonl`: 1,476 records, 3,686 mentions,
   1,299 CUIs; mixed NFC/NFD Vietnamese; inclusive token indices; null ICD-10.
-- `source/GRF/*.py`, `CONTRACT.md`, `README.md`.
+- `source/common/*.py` (shared retrieval primitives), `source/GRF/*.py`,
+  `CONTRACT.md`, `README.md`.
 
 ## Independent review and separation
 
@@ -126,9 +127,10 @@ the stale claims.
   mentions. No surface in this file maps to more than one CUI, so the homonym
   path is only exercised by an external KB. The paper's 8 datasets and Tables
   1–3 cannot be reproduced from the local data.
-- **Scale and cache bounds:** retrieval is an exact cosine scan; the feedback
-  cache is an unbounded in-process dictionary. Both are acceptable for the
-  reference-scale experiments but are not a production retrieval design.
+- **Scale and cache bounds:** retrieval is an exact cosine scan (numpy on CPU,
+  or an opt-in PyTorch GPU copy); the feedback cache is an unbounded in-process
+  dictionary. Both are acceptable for the reference-scale experiments but are
+  not a production retrieval design.
 - **No runtime validation:** behavior is reasoned statically. No tests are
   shipped; no empirical or table results are claimed.
 - **Outstanding integration/data audit:** the dedicated integration/data
