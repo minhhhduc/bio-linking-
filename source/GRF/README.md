@@ -1,10 +1,9 @@
 # GRF — Biomedical Entity Linking
 
 Implementation of the methods in [`docs/architecture.md`](../../docs/architecture.md)
-and [`paper/reference_abstract.md`](../../paper/reference_abstract.md). Apart
-from the numpy-only artifact check in `tests/`, no pipeline code in this package
-was executed during implementation; no empirical results are claimed. The static
-audit record is in [`AUDIT.md`](AUDIT.md).
+and [`paper/reference_abstract.md`](../../paper/reference_abstract.md). No
+pipeline code in this package was executed during implementation; no empirical
+results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 
 ## Component map
 
@@ -153,11 +152,9 @@ The CLI prints a warning for older indexes without that metadata. `R@5` uses
 the untruncated concept ranking, so `top_k_concept` no longer caps it; keep
 `top_k_retrieval` at least 5 when comparing with the paper.
 
-## Tests and notebooks
+## Notebooks
 
-`tests/test_npz_roundtrip.py` is a numpy-only, assert-based check for the
-single-file KB artifact (`python source/GRF/tests/test_npz_roundtrip.py`). The
-rest of the pipeline has never been executed. Colab notebooks live in
+No tests are shipped. The pipeline has never been executed. Colab notebooks live in
 [`source/notebooks/GRF/`](../notebooks/GRF/): `build_KB.ipynb` embeds the KB
 JSONL from Google Drive into the single-file artifact; `run.ipynb` loads that
 artifact, the same KB JSONL (for preferred names) and the gold data from Drive,

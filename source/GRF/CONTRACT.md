@@ -311,6 +311,5 @@ CLI: `python -m GRF.cli {build-index,normalize,evaluate}`. Wiring only.
 
 ## No-execution rule
 
-One numpy-only check is shipped: `tests/test_npz_roundtrip.py` exercises the
-single-file artifact round-trip. The pipeline, encoder, notebooks and CLI were
-never executed; do not run them during static inspection.
+No tests are shipped. The pipeline, encoder, notebooks and CLI were never
+executed; do not run them during static inspection.
