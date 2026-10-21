@@ -2,7 +2,7 @@
 
 Prompt/instruction texts are copied verbatim from
 ``paper/reference_abstract.md`` §4.  Concurrent LLM failures never propagate:
-each one is reported as a :class:`~paper_method.schemas.FeedbackFailure` so the
+each one is reported as a :class:`~GRF.schemas.FeedbackFailure` so the
 pipeline can degrade to the original query (architecture §6).
 """
 

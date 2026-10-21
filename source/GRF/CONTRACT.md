@@ -1,10 +1,10 @@
-# Implementation contract — paper_method
+# Implementation contract — GRF
 
 Frozen interfaces for parallel implementation. Derived from
 `docs/architecture.md` and `paper/reference_abstract.md`. Do not change a
 signature here without coordinating; other modules import it.
 
-Package root: `source/paper_method/`. Python 3.10+. `numpy` is the only hard
+Package root: `source/GRF/`. Python 3.10+. `numpy` is the only hard
 dependency; `sentence-transformers` is imported lazily by the encoder.
 
 ## schemas.py
@@ -174,11 +174,13 @@ class VectorIndex:
                  encoder_info=None): ...
     @classmethod
     def from_concepts(cls, concepts, encoder, *, batch_size=64,
-                      encoder_info=None) -> "VectorIndex"
+                      encoder_info=None, progress_callback=None) -> "VectorIndex"
     def search(self, query, top_k: int, *, source_kb: str | None = None
                ) -> list[RetrievalHit]
     def save(self, directory) -> None
     def load(self, directory) -> "VectorIndex"     # classmethod
+    def save_npz(self, path) -> None                # one .npz, no pickle
+    def load_npz(self, path) -> "VectorIndex"       # classmethod
     def __len__(self) -> int
 ```
 
@@ -280,11 +282,12 @@ class EntityLinker:
                  feedback_generator=None, reranker=None,
                  concept_names: Mapping[str, str] | None = None): ...
     def link(self, request: Request) -> Response
-    def link_batch(self, requests) -> list[Response]
+    def link_batch(self, requests, *, progress_callback=None) -> list[Response]
 
 class Metrics: n, recall_at_1, recall_at_5, accuracy
 def evaluate(linker, samples) -> Metrics
-def evaluate_all(linker, samples) -> tuple[Metrics, dict[str | None, Metrics]]
+def evaluate_all(linker, samples, *, progress_callback=None
+                 ) -> tuple[Metrics, dict[str | None, Metrics]]
 def evaluate_by_label(linker, samples) -> dict[str | None, Metrics]
 ```
 
@@ -304,9 +307,10 @@ evaluator for R@5), `score_kind`, and rerank mode. `rank_lists` and
 `encoder_info` when building an index and rejects a prebuilt index whose
 stored encoder differs from the requested one.
 
-CLI: `python -m paper_method.cli {build-index,normalize,evaluate}`. Wiring only.
+CLI: `python -m GRF.cli {build-index,normalize,evaluate}`. Wiring only.
 
 ## No-execution rule
 
-No tests are shipped. Do not execute Python, pytest, linters, installers, or
-any script. Static inspection only.
+One numpy-only check is shipped: `tests/test_npz_roundtrip.py` exercises the
+single-file artifact round-trip. The pipeline, encoder, notebooks and CLI were
+never executed; do not run them during static inspection.

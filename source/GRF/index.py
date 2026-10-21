@@ -1,7 +1,9 @@
 """C4: exact cosine vector index over KB surface forms.
 
 Vectors are stored L2-normalised as float32, so a dot product is cosine
-similarity. Persistence is ``vectors.npy`` + ``meta.json`` (no pickle).
+similarity. Persistence is either ``vectors.npy`` + ``meta.json``
+(:meth:`VectorIndex.save`/:meth:`VectorIndex.load`) or a single ``.npz`` file
+(:meth:`VectorIndex.save_npz`/:meth:`VectorIndex.load_npz`); neither uses pickle.
 """
 
 from __future__ import annotations
@@ -15,6 +17,9 @@ import numpy as np
 
 from .kb import surface_entries
 from .schemas import Concept, RetrievalHit
+
+# Written into single-file artifacts so a future format change can be detected.
+SINGLE_FILE_FORMAT = "grf-vector-index-npz-v1"
 
 
 class VectorIndex:
@@ -114,10 +119,17 @@ class VectorIndex:
         *,
         batch_size: int = 64,
         encoder_info: Mapping[str, str] | None = None,
+        progress_callback=None,
     ) -> "VectorIndex":
-        """Index every surface form produced by ``kb.surface_entries``."""
+        """Index every surface form produced by ``kb.surface_entries``.
+
+        ``progress_callback(done, total)``, when supplied, is called after each
+        encoded batch (used by the Colab notebooks to drive ``tqdm``).
+        """
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
+        if progress_callback is not None and not callable(progress_callback):
+            raise ValueError("progress_callback must be callable or None")
         if isinstance(concepts, (str, bytes)):
             raise ValueError("concepts must be an iterable of Concept records")
 
@@ -149,6 +161,10 @@ class VectorIndex:
             elif encoded.shape[1] != expected_dim:
                 raise ValueError("encoder returned inconsistent dimensions")
             batches.append(encoded)
+            if progress_callback is not None:
+                progress_callback(
+                    min(start + len(chunk), len(surfaces)), len(surfaces)
+                )
 
         return cls(
             np.concatenate(batches, axis=0),
@@ -245,6 +261,83 @@ class VectorIndex:
         }
         with (base / "meta.json").open("w", encoding="utf-8") as handle:
             json.dump(meta, handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def save_npz(self, path) -> None:
+        """Save the whole index into one ``.npz`` file (no pickle).
+
+        The file holds the float32 unit vectors, ``cuis``, ``surfaces``,
+        ``source_kbs`` and a JSON ``meta`` blob (format tag, count, dimension,
+        ``encoder_info``).  The encoder **model weights are not embedded**: a
+        reader must load the same checkpoint named in ``encoder_info`` to embed
+        queries into this vector space.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "format": SINGLE_FILE_FORMAT,
+            "count": len(self),
+            "dim": int(self.vectors.shape[1]),
+            "encoder_info": self.encoder_info,
+        }
+        # Unicode arrays keep the artifact pickle-free; None -> "" for source_kb.
+        with path.open("wb") as handle:
+            np.savez_compressed(
+                handle,
+                vectors=self.vectors,
+                cuis=np.asarray(list(self.cuis), dtype=np.str_),
+                surfaces=np.asarray(list(self.surfaces), dtype=np.str_),
+                source_kbs=np.asarray(
+                    ["" if kb is None else kb for kb in self.source_kbs],
+                    dtype=np.str_,
+                ),
+                meta=np.asarray(json.dumps(meta, ensure_ascii=False)),
+            )
+
+    @classmethod
+    def load_npz(cls, path) -> "VectorIndex":
+        """Load an index written by :meth:`save_npz`."""
+        path = Path(path)
+        with np.load(path, allow_pickle=False) as data:
+            required = ("vectors", "cuis", "surfaces", "source_kbs", "meta")
+            missing = [key for key in required if key not in data]
+            if missing:
+                raise ValueError(
+                    f"{path}: npz artifact is missing keys: {', '.join(missing)}"
+                )
+            vectors = np.asarray(data["vectors"], dtype=np.float32)
+            cuis = [str(value) for value in data["cuis"]]
+            surfaces = [str(value) for value in data["surfaces"]]
+            source_kbs = [str(value) or None for value in data["source_kbs"]]
+            try:
+                meta = json.loads(str(data["meta"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: invalid 'meta' JSON: {exc.msg}") from exc
+
+        if not isinstance(meta, dict):
+            raise ValueError(f"{path}: 'meta' must be a JSON object")
+        if meta.get("format") != SINGLE_FILE_FORMAT:
+            raise ValueError(
+                f"{path}: unsupported artifact format {meta.get('format')!r}; "
+                f"expected {SINGLE_FILE_FORMAT!r}"
+            )
+        if meta.get("count") != len(cuis) or meta.get("count") != vectors.shape[0]:
+            raise ValueError(
+                f"{path}: meta count {meta.get('count')!r} disagrees with "
+                f"vectors/cuis ({vectors.shape[0]}/{len(cuis)})"
+            )
+        if meta.get("dim") != vectors.shape[1]:
+            raise ValueError(
+                f"{path}: meta dim {meta.get('dim')!r} disagrees with vectors "
+                f"shape {vectors.shape!r}"
+            )
+
+        return cls(
+            vectors,
+            cuis,
+            surfaces,
+            source_kbs,
+            encoder_info=meta.get("encoder_info"),
+        )
 
     @classmethod
     def load(cls, directory) -> "VectorIndex":

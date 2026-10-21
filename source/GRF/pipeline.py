@@ -250,8 +250,26 @@ class EntityLinker:
         debug["rerank"] = rerank_debug
         return Response(cui=cui, candidates=tuple(candidates), debug=debug)
 
-    def link_batch(self, requests: Sequence[Request]) -> list[Response]:
-        return [self.link(request) for request in requests]
+    def link_batch(
+        self,
+        requests: Sequence[Request],
+        *,
+        progress_callback=None,
+    ) -> list[Response]:
+        """Link every request in order.
+
+        ``progress_callback(done, total)``, when supplied, is called after each
+        request (used by the Colab notebooks to drive ``tqdm``).
+        """
+        if progress_callback is not None and not callable(progress_callback):
+            raise ValueError("progress_callback must be callable or None")
+        items = list(requests)
+        responses: list[Response] = []
+        for done, request in enumerate(items, start=1):
+            responses.append(self.link(request))
+            if progress_callback is not None:
+                progress_callback(done, len(items))
+        return responses
 
     # ------------------------------------------------------------------
     # Pipelines

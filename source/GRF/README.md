@@ -1,9 +1,10 @@
-# paper_method — GRF for Biomedical Entity Linking
+# GRF — Biomedical Entity Linking
 
 Implementation of the methods in [`docs/architecture.md`](../../docs/architecture.md)
-and [`paper/reference_abstract.md`](../../paper/reference_abstract.md). No code
-in this package was executed during implementation; no empirical results are
-claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
+and [`paper/reference_abstract.md`](../../paper/reference_abstract.md). Apart
+from the numpy-only artifact check in `tests/`, no pipeline code in this package
+was executed during implementation; no empirical results are claimed. The static
+audit record is in [`AUDIT.md`](AUDIT.md).
 
 ## Component map
 
@@ -12,7 +13,7 @@ claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 | C1 | KB loader/parser → `Concept(cui, name, aliases)` | `kb.py` (`load_concepts_jsonl`, `concepts_from_dataset`) | §2 |
 | C2 | Homonym rewriting `a + " (" + N_c + ")"` | `kb.py` (`surface_entries`) | §3 |
 | C3 | Encoder `E(·)` (BioSyn/SapBERT) | `encoder.py` | §3, §5 |
-| C4 | Exact cosine vector index, one entry per surface form | `index.py` | §3, §4.2, §5.1 |
+| C4 | Exact cosine vector index, one entry per surface form; directory (`save`/`load`) or single-file `.npz` (`save_npz`/`load_npz`) persistence | `index.py` | §3, §4.2, §5.1 |
 | C5 | Feedback generation (`def`, `syn`, `std`) + cache + fallback | `feedback.py`, `llm.py` | §4, §6 |
 | C6 | Vector interpolation / weighted RRF | `fusion.py` | §5, §7 |
 | C7 | Concept aggregation `max` over aliases | `aggregation.py` | §7.3 |
@@ -121,23 +122,23 @@ The examples use Bash syntax. On PowerShell, set `$env:PYTHONPATH = "source"`
 and put each command on one line instead of using `\` continuations.
 
 ```bash
-pip install -r source/paper_method/requirements.txt
+pip install -r source/GRF/requirements.txt
 export PYTHONPATH=source
 
 # Build an index from a real KB JSONL.
-python -m paper_method.cli build-index --kb-jsonl kb.jsonl \
+python -m GRF.cli build-index --kb-jsonl kb.jsonl \
   --encoder cambridgeltl/SapBERT-from-PubMedBERT-fulltext --out index/
 
 # Or from the provided gold file (surrogate KB, leakage warning printed).
-python -m paper_method.cli build-index --data data/test_fixed_verified_gold_revised.jsonl \
+python -m GRF.cli build-index --data data/test_fixed_verified_gold_revised.jsonl \
   --encoder cambridgeltl/SapBERT-from-PubMedBERT-fulltext --out index-dataset/
 
 # Link one mention (baseline; empty feedback types).
-python -m paper_method.cli normalize --index index/ --mention "bệnh phong" \
+python -m GRF.cli normalize --index index/ --mention "bệnh phong" \
   --context "..." --feedback-types "" --rerank top1
 
 # Evaluate R@1/R@5/accuracy.
-python -m paper_method.cli evaluate --data data/test_fixed_verified_gold_revised.jsonl \
+python -m GRF.cli evaluate --data data/test_fixed_verified_gold_revised.jsonl \
   --data-as-kb --encoder cambridgeltl/SapBERT-from-PubMedBERT-fulltext \
   --feedback-types "" --limit 10
 ```
@@ -152,6 +153,12 @@ The CLI prints a warning for older indexes without that metadata. `R@5` uses
 the untruncated concept ranking, so `top_k_concept` no longer caps it; keep
 `top_k_retrieval` at least 5 when comparing with the paper.
 
-## Tests
+## Tests and notebooks
 
-No test suite is shipped in this tree. The code has never been executed.
+`tests/test_npz_roundtrip.py` is a numpy-only, assert-based check for the
+single-file KB artifact (`python source/GRF/tests/test_npz_roundtrip.py`). The
+rest of the pipeline has never been executed. Colab notebooks live in
+[`source/notebooks/GRF/`](../notebooks/GRF/): `build_KB.ipynb` embeds the KB
+JSONL from Google Drive into the single-file artifact; `run.ipynb` loads that
+artifact, the same KB JSONL (for preferred names) and the gold data from Drive,
+then links/evaluates.

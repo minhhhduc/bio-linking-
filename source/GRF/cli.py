@@ -272,7 +272,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m paper_method.cli")
+    parser = argparse.ArgumentParser(prog="python -m GRF.cli")
     sub = parser.add_subparsers(dest="command", required=True)
 
     build = sub.add_parser("build-index", help="build and save the vector index")

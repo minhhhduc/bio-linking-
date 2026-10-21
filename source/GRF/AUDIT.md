@@ -1,12 +1,13 @@
-# Static audit record — paper_method
+# Static audit record — GRF
 
 Status: static audit and independent read-only re-audits completed on the
 current tree. **No project code was executed** at any stage: no Python, tests,
 imports, builds, notebooks, linters, formatters, type checkers, dependency
 installs, or API calls. File inspection was read-only.
 
-The `tests/` directory mentioned below was removed from the tree after this
-audit at the user's request; those mentions describe the tree at audit time.
+The `tests/` directory now contains only `tests/test_npz_roundtrip.py`, a
+numpy-only check of the single-file KB artifact; mentions of the larger test
+suite below describe the tree at audit time.
 
 ## Sources used
 
@@ -16,7 +17,7 @@ audit at the user's request; those mentions describe the tree at audit time.
   §4, pipelines §5, non-reproducible empirical tables §6.
 - `data/test_fixed_verified_gold_revised.jsonl`: 1,476 records, 3,686 mentions,
   1,299 CUIs; mixed NFC/NFD Vietnamese; inclusive token indices; null ICD-10.
-- `source/paper_method/*.py`, `tests/*.py`, `CONTRACT.md`, `README.md`.
+- `source/GRF/*.py`, `source/GRF/tests/*.py`, `CONTRACT.md`, `README.md`.
 
 ## Independent review and separation
 

@@ -2,7 +2,7 @@
 
 See ``README.md`` for the mapping between components, reference equations and
 modules.  ``sentence-transformers`` is imported lazily by
-:class:`paper_method.encoder.SentenceTransformerEncoder`, so importing this
+:class:`GRF.encoder.SentenceTransformerEncoder`, so importing this
 package needs only numpy.
 """
 

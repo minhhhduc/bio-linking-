@@ -113,10 +113,17 @@ def _metrics(samples: Sequence[MentionSample], responses: Sequence[Response]) ->
     )
 
 
-def _link(linker, samples: Sequence[MentionSample]) -> Sequence[Response]:
+def _link(
+    linker,
+    samples: Sequence[MentionSample],
+    progress_callback=None,
+) -> Sequence[Response]:
     """Run the pipeline once and enforce a one-response-per-sample contract."""
     requests = make_requests(samples, linker.config)
-    responses = linker.link_batch(requests)
+    if progress_callback is None:
+        responses = linker.link_batch(requests)
+    else:
+        responses = linker.link_batch(requests, progress_callback=progress_callback)
     if len(responses) != len(samples):
         raise ValueError(
             "linker.link_batch returned "
@@ -138,16 +145,24 @@ def evaluate(linker, samples: Iterable[MentionSample]) -> Metrics:
 
 
 def evaluate_all(
-    linker, samples: Iterable[MentionSample]
+    linker,
+    samples: Iterable[MentionSample],
+    *,
+    progress_callback=None,
 ) -> tuple[Metrics, dict[str | None, Metrics]]:
     """Overall and per-label metrics from **one** pipeline run.
 
     Evaluating overall and by label separately would call the LLM twice; since
     failed feedback calls are deliberately not cached, the two reports could
     then disagree (and every request would pay twice).
+
+    ``progress_callback(done, total)`` is forwarded to ``link_batch`` for
+    per-sample progress reporting in the Colab notebooks.
     """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
     sample_list = list(samples)
-    responses = _link(linker, sample_list)
+    responses = _link(linker, sample_list, progress_callback)
 
     groups: dict[str | None, tuple[list[MentionSample], list[Response]]] = {}
     for sample, response in zip(sample_list, responses):
