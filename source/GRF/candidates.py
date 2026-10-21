@@ -61,8 +61,12 @@ def save_candidates(
     path: str | Path,
     samples: Sequence[MentionSample],
     responses: Sequence[Response],
+    *,
+    progress_callback=None,
 ) -> None:
     """Write samples and their retrieval responses to one JSONL file."""
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
     sample_list = list(samples)
     response_list = list(responses)
     if len(sample_list) != len(response_list):
@@ -99,10 +103,25 @@ def save_candidates(
                 "error": debug.get("error"),
             }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if progress_callback is not None:
+                progress_callback(index + 1, len(sample_list))
 
 
-def load_candidates(path: str | Path) -> tuple[list[MentionSample], list[Response]]:
-    """Read a file written by :func:`save_candidates`."""
+def load_candidates(
+    path: str | Path, *, progress_callback=None, total: int | None = None
+) -> tuple[list[MentionSample], list[Response]]:
+    """Read a file written by :func:`save_candidates`.
+
+    ``progress_callback(done, total)`` is called after each record is parsed;
+    pass ``total`` when the caller has already counted the records, otherwise
+    it is ``None``.
+    """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
+    if total is not None and (
+        isinstance(total, bool) or not isinstance(total, int) or total < 0
+    ):
+        raise ValueError("total must be a non-negative integer or None")
     source = Path(path)
     samples: list[MentionSample] = []
     responses: list[Response] = []
@@ -174,6 +193,8 @@ def load_candidates(path: str | Path) -> tuple[list[MentionSample], list[Respons
             )
             samples.append(sample)
             responses.append(response)
+            if progress_callback is not None:
+                progress_callback(len(samples), total)
     return samples, responses
 
 

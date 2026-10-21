@@ -29,7 +29,9 @@ def is_homonym_surface(a: str, b: str) -> bool:
     return _normalize(a) == _normalize(b)
 
 
-def load_concepts_jsonl(path: str | Path) -> list[Concept]:
+def load_concepts_jsonl(
+    path: str | Path, *, progress_callback=None, total: int | None = None
+) -> list[Concept]:
     """Load a concept KB from JSON Lines.
 
     Each non-blank line must be a JSON object with non-empty string ``cui`` and
@@ -38,8 +40,17 @@ def load_concepts_jsonl(path: str | Path) -> list[Concept]:
     including a repeated ``(cui, source_kb)`` pair (a concept record already
     carries all of its aliases), raises ``ValueError`` naming the offending
     line.  The same CUI may appear once per source KB so that the index can be
-    filtered by ``source_kb``.
+    filtered by ``source_kb``.  ``progress_callback(done, total)`` is called
+    after each concept is parsed; pass ``total`` when the caller has already
+    counted the records, otherwise it is ``None``.
     """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
+    if total is not None and (
+        isinstance(total, bool) or not isinstance(total, int) or total < 0
+    ):
+        raise ValueError("total must be a non-negative integer or None")
+
     path = Path(path)
     concepts: list[Concept] = []
     seen_concepts: dict[tuple[str, str | None], int] = {}
@@ -115,6 +126,8 @@ def load_concepts_jsonl(path: str | Path) -> list[Concept]:
                     source_kb=source_kb,
                 )
             )
+            if progress_callback is not None:
+                progress_callback(len(concepts), total)
     return concepts
 
 
@@ -190,6 +203,8 @@ def concepts_from_dataset(
 
 def surface_entries(
     concepts: Iterable[Concept],
+    *,
+    progress_callback=None,
 ) -> list[tuple[str, str, str | None]]:
     """Expand concepts into ``(cui, surface, source_kb)`` index entries.
 
@@ -205,13 +220,16 @@ def surface_entries(
     duplicate entry for the same concept.  Ordering is deterministic: concept
     input order, preferred name before aliases, aliases in their input order.
     """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
     if isinstance(concepts, (str, bytes)):
         raise ValueError("concepts must be an iterable of Concept records")
 
+    concept_list = list(concepts)
     expanded: list[tuple[Concept, list[tuple[str, bool]]]] = []
     alias_concepts: dict[str, set[str]] = {}
 
-    for concept in concepts:
+    for done, concept in enumerate(concept_list, start=1):
         listed = (concept.name, *concept.aliases)
         if isinstance(concept.aliases, str):
             raise ValueError("Concept.aliases must be a sequence, not a string")
@@ -228,6 +246,8 @@ def surface_entries(
             if index > 0:
                 alias_concepts.setdefault(surface, set()).add(concept.cui)
         expanded.append((concept, surfaces))
+        if progress_callback is not None:
+            progress_callback(done, len(concept_list))
 
     entries: list[tuple[str, str, str | None]] = []
     for concept, surfaces in expanded:

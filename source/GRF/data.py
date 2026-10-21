@@ -156,7 +156,11 @@ def _read_span(
 
 
 def load_bel_jsonl(
-    path: str | Path, *, strict: bool = False
+    path: str | Path,
+    *,
+    strict: bool = False,
+    progress_callback=None,
+    total: int | None = None,
 ) -> DatasetLoadResult:
     """Load gold BEL samples from a JSONL file.
 
@@ -168,8 +172,17 @@ def load_bel_jsonl(
     ``cui``/``vi_term``, bad label type) also raise.  Otherwise they become
     ``bad_record`` / ``bad_entity`` issues and the affected unit is skipped.
     Span issues are always non-fatal and never drop a structurally valid
-    sample.
+    sample.  ``progress_callback(done, total)`` is called after each non-blank
+    record is parsed; pass ``total`` when the caller has already counted the
+    records, otherwise it is ``None``.
     """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
+    if total is not None and (
+        isinstance(total, bool) or not isinstance(total, int) or total < 0
+    ):
+        raise ValueError("total must be a non-negative integer or None")
+
     path = Path(path)
     samples: list[MentionSample] = []
     issues: list[DataIssue] = []
@@ -188,6 +201,9 @@ def load_bel_jsonl(
                 raise DataValidationError(
                     f"line {line_number}: invalid JSON: {exc.msg}"
                 ) from exc
+
+            if progress_callback is not None:
+                progress_callback(record_index + 1, total)
 
             if not isinstance(record, dict):
                 _structural_error(

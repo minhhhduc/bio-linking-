@@ -120,11 +120,14 @@ class VectorIndex:
         batch_size: int = 64,
         encoder_info: Mapping[str, str] | None = None,
         progress_callback=None,
+        entries: Iterable[tuple[str, str, str | None]] | None = None,
     ) -> "VectorIndex":
         """Index every surface form produced by ``kb.surface_entries``.
 
         ``progress_callback(done, total)``, when supplied, is called after each
-        encoded batch (used by the Colab notebooks to drive ``tqdm``).
+        encoded batch (used by the Colab notebooks to drive ``tqdm``).  Pass
+        ``entries`` to reuse an expansion the caller already computed instead
+        of recomputing it from ``concepts``.
         """
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
@@ -133,7 +136,9 @@ class VectorIndex:
         if isinstance(concepts, (str, bytes)):
             raise ValueError("concepts must be an iterable of Concept records")
 
-        entries = list(surface_entries(list(concepts)))
+        if entries is None:
+            entries = surface_entries(list(concepts))
+        entries = list(entries)
         if not entries:
             return cls(
                 np.zeros((0, encoder.dim), dtype=np.float32),

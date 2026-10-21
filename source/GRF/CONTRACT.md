@@ -7,6 +7,12 @@ signature here without coordinating; other modules import it.
 Package root: `source/GRF/`. Python 3.10+. `numpy` is the only hard
 dependency; `sentence-transformers` is imported lazily by the encoder.
 
+Progress convention: every record-scanning function the notebooks run takes an
+optional `progress_callback(done, total)`; `total` may be `None` when unknown.
+Callers that already counted the input pass an explicit `total` so the bar has
+a percentage. The notebooks render these callbacks with `tqdm`.
+`concepts_from_dataset` (CLI-only gold-to-KB derivation) has no callback.
+
 ## schemas.py
 
 ```python
@@ -84,9 +90,11 @@ empty `target_kb`/`llm_model`, `index_kb` empty string.
 ## kb.py  (C1 + C2)
 
 ```python
-def load_concepts_jsonl(path) -> list[Concept]
+def load_concepts_jsonl(path, *, progress_callback=None,
+                        total: int | None = None) -> list[Concept]
 def concepts_from_dataset(records) -> list[Concept]
-def surface_entries(concepts) -> list[tuple[str, str, str | None]]
+def surface_entries(concepts, *, progress_callback=None
+                    ) -> list[tuple[str, str, str | None]]
     # (cui, surface, source_kb); preferred name first, aliases deduped,
     # homonyms rewritten as: f"{surface} ({concept.name})"
 def is_homonym_surface(a: str, b: str) -> bool   # optional helper
@@ -133,7 +141,8 @@ class DatasetLoadResult:
     samples: tuple[MentionSample, ...]
     issues: tuple[DataIssue, ...]
 
-def load_bel_jsonl(path, *, strict: bool = False) -> DatasetLoadResult
+def load_bel_jsonl(path, *, strict: bool = False, progress_callback=None,
+                   total: int | None = None) -> DatasetLoadResult
 ```
 
 Mention text comes from `vi_term`. Gold CUI and mention are stripped and
@@ -174,7 +183,9 @@ class VectorIndex:
                  encoder_info=None): ...
     @classmethod
     def from_concepts(cls, concepts, encoder, *, batch_size=64,
-                      encoder_info=None, progress_callback=None) -> "VectorIndex"
+                      encoder_info=None, progress_callback=None,
+                      entries=None) -> "VectorIndex"
+        # entries: reuse a caller-computed surface_entries() expansion
     def search(self, query, top_k: int, *, source_kb: str | None = None
                ) -> list[RetrievalHit]
     def save(self, directory) -> None
@@ -287,8 +298,9 @@ saved-candidate paths degrade identically.
 
 ```python
 FORMAT = "grf-candidates-v1"
-def save_candidates(path, samples, responses) -> None
-def load_candidates(path) -> tuple[list[MentionSample], list[Response]]
+def save_candidates(path, samples, responses, *, progress_callback=None) -> None
+def load_candidates(path, *, progress_callback=None, total: int | None = None
+                    ) -> tuple[list[MentionSample], list[Response]]
 def rerank_candidates(samples, responses, *, reranker, concept_names=None,
                       progress_callback=None) -> list[Response]
 ```
@@ -301,7 +313,8 @@ gold CUI, label, token spans, record/entity indices), retrieval `cui`,
 `Response.debug["concept_ranking"]`, so `metrics_from_responses` can compute
 R@1/R@5 without re-running retrieval. `rerank_candidates` applies
 `select_with_fallback` and reports progress; it never loads the encoder or the
-vector index.
+vector index. `save_candidates`/`load_candidates` accept the same
+`progress_callback`; pass `total` when the caller already counted the records.
 
 ## pipeline.py + evaluator.py + cli.py
 

@@ -166,3 +166,7 @@ in [`source/notebooks/GRF/`](../notebooks/GRF/):
 - `e2e.ipynb` reads only that candidate file, applies Top-1 or the LLM
   re-ranker (`candidates.rerank_candidates`), and reports end-to-end accuracy;
   it never loads the encoder, the index or the KB artifact.
+
+Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
+data loading, re-ranking) drives a `tqdm` bar through the library's
+`progress_callback`; all three notebooks install `tqdm` explicitly.
