@@ -39,6 +39,7 @@ from .feedback import (
     parse_synonyms,
 )
 from .fusion import component_weights, interpolate_vectors, rrf_scores
+from .hf_llm import TransformersChatClient
 from .index import VectorIndex
 from .kb import concepts_from_dataset, load_concepts_jsonl, surface_entries
 from .llm import LLMClient, LLMError, OpenAICompatibleClient
@@ -90,6 +91,7 @@ __all__ = [
     "Response",
     "RetrievalHit",
     "SentenceTransformerEncoder",
+    "TransformersChatClient",
     "VectorIndex",
     "aggregate_hits",
     "build_encoder",

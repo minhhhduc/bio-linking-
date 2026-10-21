@@ -112,24 +112,32 @@ class LLMReranker:
     """Ask the LLM to pick one CUI from the candidate list.
 
     ``timeout_s`` is forwarded to :meth:`LLMClient.complete`; pass a client
-    configured with ``temperature=0.0`` for deterministic choices.  The prompt
-    deliberately lists candidates by number and CUI, but only a CUI string is
-    accepted as an answer — a bare index such as ``"2"`` is rejected.
+    configured with ``temperature=0.0`` for deterministic choices.  ``None``
+    means "use the client's own timeout policy": the OpenAI client then applies
+    its configured default, while a locally loaded model has none.  The prompt
+    deliberately lists candidates by number and CUI, but
+    only a CUI string is accepted as an answer — a bare index such as ``"2"``
+    is rejected.
     """
 
-    def __init__(self, llm: LLMClient, *, timeout_s: float = 30.0) -> None:
-        if isinstance(timeout_s, bool):
-            raise ValueError(f"timeout_s must be a number, got {timeout_s!r}")
-        try:
-            timeout = float(timeout_s)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"timeout_s must be a number, got {timeout_s!r}") from exc
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError(
-                f"timeout_s must be a positive finite number, got {timeout_s!r}"
-            )
+    def __init__(self, llm: LLMClient, *, timeout_s: float | None = 30.0) -> None:
+        if timeout_s is None:
+            self._timeout_s = None
+        else:
+            if isinstance(timeout_s, bool):
+                raise ValueError(f"timeout_s must be a number or None, got {timeout_s!r}")
+            try:
+                timeout = float(timeout_s)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"timeout_s must be a number or None, got {timeout_s!r}"
+                ) from exc
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError(
+                    f"timeout_s must be a positive finite number, got {timeout_s!r}"
+                )
+            self._timeout_s = timeout
         self._llm = llm
-        self._timeout_s = timeout
 
     def rerank(
         self,

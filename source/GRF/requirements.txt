@@ -1,3 +1,7 @@
 numpy>=1.24
 # Required only by SentenceTransformerEncoder (BioSyn/SapBERT checkpoints).
 sentence-transformers>=2.7
+# Required only by the CLI's local backend (--llm-backend local) and, in the
+# notebooks, by LLM_BACKEND = "local". Colab already ships a matched torch.
+transformers>=4.44
+torch>=2.2

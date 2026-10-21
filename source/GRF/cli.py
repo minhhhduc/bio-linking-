@@ -18,12 +18,17 @@ from .data import load_bel_jsonl
 from .encoder import build_encoder
 from .evaluator import evaluate_all
 from .feedback import FeedbackGenerator
+from .hf_llm import DTYPES, TransformersChatClient
 from .index import VectorIndex
 from .kb import concepts_from_dataset, load_concepts_jsonl
-from .llm import OpenAICompatibleClient
+from .llm import LLMError, OpenAICompatibleClient
 from .pipeline import EntityLinker
 from .rerank import LLMReranker
 from .schemas import Request
+
+LLM_BACKENDS = ("local", "api")
+LOCAL_LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+API_LLM_MODEL = "gpt-4o"
 
 
 def _parse_feedback_types(value: str) -> tuple[str, ...]:
@@ -52,8 +57,48 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-k-concept", type=int, default=5)
     parser.add_argument("--fusion", choices=FUSION_KINDS, default="vector")
     parser.add_argument("--rerank", choices=RERANK_KINDS, default="top1")
-    parser.add_argument("--llm-model", default="gpt-4o")
+    parser.add_argument(
+        "--llm-backend",
+        choices=LLM_BACKENDS,
+        default="api",
+        help="'api' = OpenAI-compatible endpoint, 'local' = transformers weights",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="model id or local path; defaults per backend "
+        "(api: gpt-4o, local: Qwen/Qwen2.5-7B-Instruct)",
+    )
+    parser.add_argument("--llm-device", default="auto", help="local backend: auto/cuda/cpu")
+    parser.add_argument(
+        "--llm-dtype",
+        choices=DTYPES,
+        default="auto",
+        help="local backend: weight dtype",
+    )
+    parser.add_argument("--llm-max-new-tokens", type=int, default=256)
+    parser.add_argument("--llm-temperature", type=float, default=0.0)
     parser.add_argument("--index-kb", default=None)
+
+
+def _build_llm_client(args: argparse.Namespace):
+    """Local transformers client or OpenAI-compatible client, per ``--llm-backend``."""
+    if args.llm_backend == "local":
+        model = args.llm_model or LOCAL_LLM_MODEL
+        # Note: the client loads the weights lazily on the first call.
+        print(
+            f"Using local LLM {model!r} on {args.llm_device} "
+            "(weights load on the first call).",
+            file=sys.stderr,
+        )
+        return TransformersChatClient(
+            model,
+            device=args.llm_device,
+            dtype=args.llm_dtype,
+            max_new_tokens=args.llm_max_new_tokens,
+            temperature=args.llm_temperature,
+        )
+    return OpenAICompatibleClient(args.llm_model or API_LLM_MODEL)
 
 
 def _config(args: argparse.Namespace) -> PipelineConfig:
@@ -66,7 +111,8 @@ def _config(args: argparse.Namespace) -> PipelineConfig:
         top_k_concept=args.top_k_concept,
         fusion=args.fusion,
         rerank=args.rerank,
-        llm_model=args.llm_model,
+        llm_model=args.llm_model
+        or (LOCAL_LLM_MODEL if args.llm_backend == "local" else API_LLM_MODEL),
         index_kb=args.index_kb,
     )
 
@@ -128,13 +174,17 @@ def _build_linker(
     concept_names,
     *,
     encoder=None,
+    args: argparse.Namespace | None = None,
 ):
     if encoder is None:
         encoder = build_encoder(config)
 
     llm = None
     if config.feedback_types or config.rerank == "llm":
-        llm = OpenAICompatibleClient(config.llm_model)
+        if args is None:
+            llm = OpenAICompatibleClient(config.llm_model)
+        else:
+            llm = _build_llm_client(args)
 
     generator = None
     if config.feedback_types:
@@ -142,7 +192,15 @@ def _build_linker(
 
     reranker = None
     if config.rerank == "llm":
-        reranker = LLMReranker(llm)
+        # A local client has no timeout of its own.
+        reranker = LLMReranker(
+            llm,
+            timeout_s=(
+                None
+                if args is not None and args.llm_backend == "local"
+                else 30.0
+            ),
+        )
 
     return EntityLinker(
         index,
@@ -191,21 +249,8 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     config = _config(args)
     index = VectorIndex.load(args.index)
     _check_index_encoder(index, config)
-    linker = EntityLinker(
-        index,
-        build_encoder(config),
-        config,
-        feedback_generator=(
-            FeedbackGenerator(OpenAICompatibleClient(config.llm_model))
-            if config.feedback_types
-            else None
-        ),
-        reranker=(
-            LLMReranker(OpenAICompatibleClient(config.llm_model))
-            if config.rerank == "llm"
-            else None
-        ),
-        concept_names=_concept_names_from_index(index),
+    linker = _build_linker(
+        index, config, _concept_names_from_index(index), args=args
     )
     response = linker.link(
         Request(
@@ -257,7 +302,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         )
         concept_names = _concept_names_from_concepts(concepts)
 
-    linker = _build_linker(index, config, concept_names, encoder=encoder)
+    linker = _build_linker(index, config, concept_names, encoder=encoder, args=args)
     overall, by_label = evaluate_all(linker, samples)
     print(json.dumps(
         {
@@ -310,7 +355,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, LLMError) as exc:
+        # LLMError is a misconfiguration (bad --llm-device/dtype/model), so it
+        # belongs in a usage message rather than a traceback.
         parser.error(str(exc))
 
 

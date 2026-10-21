@@ -1,9 +1,11 @@
 # Static audit record — GRF
 
 Status: static audit and independent read-only re-audits completed on the
-current tree. **No project code was executed** at any stage: no Python, tests,
-imports, builds, notebooks, linters, formatters, type checkers, dependency
-installs, or API calls. File inspection was read-only.
+current tree. **No pipeline, encoder, retrieval, LLM or notebook code was
+executed** at any stage. The only interpreter use is the static check set
+described under "No-execution confirmation": byte-compilation, the numpy-only
+`import GRF` path, and AST-parsing of notebook cells. No model weights were
+downloaded, no embedding, retrieval pass or API call was made.
 
 The `tests/` directory mentioned below is not present in the current tree;
 those mentions describe the tree at audit time.
@@ -30,6 +32,15 @@ tree without editing files:
   fallback semantics.
 - Edge-case/maintainability re-auditor `a970c0bdc9979dfad`: validation,
   persistence, Unicode, CLI wiring, error paths, test coverage.
+- A read-only re-auditor of the local-LLM backend and the two Colab notebooks
+  (retrieval, e2e) reported on: lazy loading, device/dtype resolution,
+  chat-template use, thread safety against `FeedbackGenerator`'s pool,
+  `LLMError` wrapping on both load and generation paths, `unload()`
+  reachability, no remaining OpenAI-API dependency on the `"local"` path, and
+  notebook cell-by-cell name resolution. It found the device/dtype ordering
+  defect recorded below (fixed) and one false positive (a claimed `KeyError`
+  in `e2e.ipynb`'s failure comprehension; the `if` clause runs before the
+  output expression, so the `{}` shape cannot raise — verified, no change made).
 - A separate integration/data auditor `a0e56472123e21a1d` was dispatched. It
   produced no report before this record was written; **no findings from it are
   claimed here**. That is an outstanding verification gap, not a clean result.
@@ -41,6 +52,7 @@ reports were used as evidence, not as runtime proof.
 
 | Severity | Location | Defect | Fix / evidence |
 | --- | --- | --- | --- |
+| High | `hf_llm.py:215-219` (was) | `_dtype_argument` read the *unresolved* device: `_load_model` runs before `_resolved_device` is set, so `device="auto"` fell back to the raw `"auto"` string, which is not a CUDA device, and picked `float32`. With the notebooks' defaults (`LLM_LOCAL_DEVICE`/`LLM_LOCAL_DTYPE` = `"auto"`, 7B model) the weights would load at ~28 GB on a Colab GPU, raising CUDA OOM that is swallowed as per-kind `FeedbackFailure` — a silent `Q_0` baseline identical to no feedback. | The device is now passed into `_dtype_argument(torch, device)` and resolved before loading; `_device_kind` was removed. Simulated CUDA load confirmed `dtype="auto"` → `bfloat16`. |
 | High | `evaluator.py:26` | Syntax corruption `accuracy: float///` blocked package import and every test. | Changed to `accuracy: float`; both independent re-audits confirmed the syntax fix. |
 | High | `evaluator.py:58-88`, `pipeline.py:218-222` | R@1/R@5 used `Response.candidates`, which is truncated to `top_k_concept`; R@5 was capped. | Evaluator now reads the untruncated `debug["concept_ranking"]`, with nested fallback; both pipelines record the full ranking. |
 | High | `evaluator.py:116-125` | A linker returning fewer responses than requests was silently truncated by `zip`, producing incorrect metrics. | `_link` raises when the response count differs. |
@@ -56,6 +68,9 @@ reports were used as evidence, not as runtime proof.
 | Low | `evaluator.py:66-88` | Empty or malformed top-level rankings could produce empty/partial metrics. | The ranking is validated; invalid entries fall back to candidates. Tests cover empty/malformed lists. |
 | Low | `evaluator.py:140-170`, `cli.py:260` | Overall and per-label evaluation ran the pipeline twice, so uncached LLM failures could make reports disagree. | `evaluate_all` computes both from one `link_batch` pass. |
 | Low | `rerank.py:70-78` | `timeout_s=inf`/`nan` passed validation. | Timeout must be positive and finite. |
+| Low | `AUDIT.md`, `README.md`, `CONTRACT.md` | The "`dtype=\"auto\"` is device-aware" claim was documented as verified while the code contradicted it (see the High row above). | Claims now match the fixed code; the pre-fix state is recorded here. |
+| Low | `cli.py:88` (was) | The CLI printed `Loading local LLM ...` although the client loads lazily on the first `complete()`. | Message now says the weights load on the first call. |
+| Low | `cli.py:353` (was) | Only `(ValueError, OSError)` reached `parser.error`; a bad `--llm-device`/`--llm-dtype` raised `LLMError` (a `RuntimeError`) and printed a traceback. | `LLMError` is caught and reported as a usage error; verified to exit 2 with a usage message. |
 | Low | `tests/test_*.py` | Tests depended on the caller's `PYTHONPATH`. | Each test file inserts `source/` into `sys.path`. |
 
 ## Independent re-audit outcome
@@ -64,7 +79,10 @@ The method re-auditor confirmed that the R@5 truncation, gold-CUI
 normalisation, and malformed-ranking findings no longer hold, and found no
 regression in the changed pipeline/evaluator/KB/data/feedback paths. The edge
 re-auditor confirmed the evaluator syntax and fusion boolean fixes and left no
-High-severity correctness finding. Surviving items were documentation
+High-severity correctness finding. The local-LLM/notebook re-auditor then found
+the device/dtype ordering defect recorded above, which is fixed; it also
+reported one false positive (the claimed `KeyError` in the `e2e` failure
+comprehension), verified not to occur. Surviving items were documentation
 staleness, the risks listed below, and test-coverage gaps; this file replaces
 the stale claims.
 
@@ -133,6 +151,15 @@ the stale claims.
   not a production retrieval design.
 - **No runtime validation:** behavior is reasoned statically. No tests are
   shipped; no empirical or table results are claimed.
+- **Local LLM backend (`hf_llm.py`):** `timeout_s` is accepted and ignored — a
+  local generation cannot be interrupted mid-step without leaving the CUDA
+  context undefined, so a hung model stalls the feedback stage instead of
+  degrading. In `retrieval.ipynb` a local feedback model is a third CUDA
+  resident alongside the SapBERT encoder and the index's GPU copy, so an
+  out-of-memory load degrades to per-kind feedback failures (silent `Q_0`
+  fallback) rather than a crash. On a 16 GB Colab GPU use a small model or
+  `LLM_LOCAL_DEVICE = "cpu"`. `dtype="auto"` is device-aware and deliberately
+  does **not** follow the checkpoint's own (often `float32`) config dtype.
 - **Outstanding integration/data audit:** the dedicated integration/data
   auditor produced no report. Integration and data correctness beyond the
   checks listed in this record remain unverified by that independent pass.
@@ -155,13 +182,19 @@ the stale claims.
 - Inclusive token spans are validated against `context.split()`; null ICD-10
   is ignored without inventing labels.
 - Encoder metadata is persisted and checked by the CLI.
+- Local LLM path: no `OPENAI_API_KEY` is read and no API client is constructed
+  when `LLM_BACKEND = "local"`; the notebook constant selects the model; the
+  weights load through `transformers` lazily on the first call; `dtype="auto"`
+  is device-aware; generation is serialised against the feedback thread pool;
+  `unload()` is reachable at the end of both notebooks; a load or generation
+  failure raises `LLMError` and degrades like a failed API call.
 
 ## Complexity audit (ponytail, read-only)
 
 Findings only; no cuts applied.
 
 - `yagni: FeedbackCache Protocol has one implementation and is not exported; accept the concrete cache or a duck-typed object. [feedback.py:161-164]`
-- `yagni: LLMClient Protocol has one production implementation; type against the concrete client or a callable. [llm.py:25-28]`
+- `yagni: LLMClient Protocol now has two production implementations (API and local transformers); it earns its keep. [llm.py:25-28]`
 - `yagni: Encoder Protocol has one production implementation; keep only if a second encoder adapter is planned. [encoder.py:21-29]`
 - `delete: is_homonym_surface has no production caller; its test can exercise the normalisation through surface_entries. [kb.py:27-29]`
 - `shrink: evaluate_by_label is a one-line wrapper; call evaluate_all(...)[1] if it is not retained as public API. [evaluator.py:166-170]`
@@ -171,7 +204,18 @@ correctness defects, and were not applied.
 
 ## No-execution confirmation
 
-No application or package code was run. No Python interpreter, test runner,
-build, notebook, linter, formatter, type checker, dependency installer, or API
-client was invoked. No execution results or empirical performance claims are
-made.
+No application or package code was run. The pipeline, encoder, retrieval, LLM
+clients and all four notebooks were never executed; no notebook cell, model
+download, embedding, retrieval pass or API call was performed. No empirical or
+performance results are claimed.
+
+Two static checks were run and are the only interpreter use:
+
+- `python -I -m compileall source/common source/GRF` — byte-compiles to catch
+  syntax errors. This compiles only; it executes no module body.
+- `python -I -c "import GRF"` — confirms `import GRF` still pulls in numpy only
+  and not `torch`/`transformers`/`sentence_transformers` (module bodies do run
+  under import, so this is a real execution of the numpy-only import path, not
+  a claim about the heavy paths).
+- Notebook cells were AST-parsed (not executed) to check that every name is
+  bound before use, measured cell-by-cell in order.

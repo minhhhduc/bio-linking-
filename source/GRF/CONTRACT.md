@@ -271,6 +271,41 @@ def build_prompt(mention, context, instruction) -> str
 def parse_synonyms(text: str, n: int) -> tuple[str, ...]
 ```
 
+`hf_llm.py` is the second `LLMClient` implementation, so `FeedbackGenerator`
+and `LLMReranker` are backend-agnostic:
+
+```python
+DTYPES = ("auto", "float16", "bfloat16", "float32")   # imported by the CLI
+
+class TransformersChatClient:      # lazy torch/transformers import
+    def __init__(self, model_name, *, device="auto", dtype="auto",
+                 max_new_tokens=256, temperature=0.0,
+                 trust_remote_code=False, use_chat_template=True): ...
+    def complete(self, prompt, *, timeout_s=None) -> str
+    def unload(self) -> None
+    @property
+    def loaded_device(self) -> str | None
+```
+
+`model_name` is a HuggingFace id or a local directory. Weights load on the
+first `complete()` and stay resident until `unload()`; generation is serialised
+with a lock because feedback calls are concurrent and one resident model serves
+one generation at a time. `temperature=0.0` is greedy, matching the API
+client's default. `device="auto"` resolves to CUDA when the runtime has one;
+`dtype="auto"` is then resolved *from that resolved device* (`bfloat16` on
+CUDA, `float32` on CPU), *not* the checkpoint's own dtype — the device is
+resolved before the weights load, so the default `"auto"`/`"auto"` pair really
+does load bfloat16 on a GPU.
+`timeout_s` is accepted and ignored: a local generation
+cannot be interrupted mid-step without leaving the CUDA context undefined.
+`use_chat_template=False` feeds the raw prompt instead of
+`tokenizer.apply_chat_template`. Setup failures (missing dependency, device the
+runtime does not have, unloadable checkpoint, move-to-device) and generation
+failures (OOM, unsupported dtype) all surface as `LLMError`, so they degrade
+exactly like a failed API call. The class is not a GPU-free operation: a local
+model is a third CUDA resident alongside the encoder and the index's GPU copy,
+which matters on a Colab-sized device.
+
 Prompt template exactly:
 `Context: {s}\nMention: {m}\nInstruction: {t}`.
 Instruction texts are copied verbatim from reference_abstract §4. Feedback
@@ -291,8 +326,12 @@ class Reranker(Protocol):
 
 class PickTopOne: ...
 class LLMReranker:
-    def __init__(self, llm: LLMClient, *, timeout_s: float = 30.0): ...
+    def __init__(self, llm: LLMClient, *, timeout_s: float | None = 30.0): ...
 ```
+
+`timeout_s=None` forwards no timeout of its own, which means "use the client's
+policy": the OpenAI client applies its configured default, a local model has
+none. `LLMReranker` still validates a numeric timeout when one is given.
 
 `PickTopOne` returns the CUI with the largest finite `Candidate.score`, with
 `cui` ascending as the tie-break (architecture §8); it does not assume the

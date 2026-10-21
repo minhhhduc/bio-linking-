@@ -13,7 +13,7 @@ results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 | C2 | Homonym rewriting `a + " (" + N_c + ")"` | `common/kb.py` (`surface_entries`) | §3 |
 | C3 | Encoder `E(·)` (BioSyn/SapBERT) | `common/encoder.py` | §3, §5 |
 | C4 | Exact cosine vector index, one entry per surface form; directory (`save`/`load`) or single-file `.npz` (`save_npz`/`load_npz`) persistence | `common/index.py` | §3, §4.2, §5.1 |
-| C5 | Feedback generation (`def`, `syn`, `std`) + cache + fallback | `feedback.py`, `llm.py` | §4, §6 |
+| C5 | Feedback generation (`def`, `syn`, `std`) + cache + fallback | `feedback.py`; clients in `llm.py` (API) and `hf_llm.py` (local transformers) | §4, §6 |
 | C6 | Vector interpolation / weighted RRF | `fusion.py` | §5, §7 |
 | C7 | Concept aggregation `max` over aliases | `common/aggregation.py` | §7.3 |
 | C8 | Pick Top-1 / LLM re-ranker (no index access) | `rerank.py` | §8 |
@@ -81,11 +81,30 @@ multiple source KBs (`index_kb=None` searches all entries).
 `dmis-lab/biosyn-sapbert-bc5cdr-disease`. Models are loaded through
 `SentenceTransformer`, so the BioSyn checkpoint uses the library's default
 pooling rather than BioSyn's own inference script; strict BioSyn reproduction
-would need a custom `Encoder` adapter. The LLM client is OpenAI-compatible
-(`OPENAI_API_KEY`, `OPENAI_BASE_URL`, default model `gpt-4o`) and uses
-`temperature=0.0` for determinism. This temperature is an implementation
-choice; the reference does not state one. Results cannot be validated against
-the paper's tables with the local data.
+would need a custom `Encoder` adapter.
+
+Feedback and re-ranking accept either backend, both behind the same
+`LLMClient` protocol:
+
+- `OpenAICompatibleClient` (`llm.py`) — HTTP, OpenAI-compatible endpoint
+  (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, default model `gpt-4o`), stdlib only,
+  `temperature=0.0` for determinism.
+- `TransformersChatClient` (`hf_llm.py`) — weights loaded through
+  `transformers` from a Hub id or a local directory, no API key and no network
+  at inference time. Loaded lazily, kept resident, reusable chat template
+  (disable with `use_chat_template=False`), greedy when
+  `temperature=0.0`. `device="auto"` picks CUDA when the runtime has it, and
+  `dtype="auto"` is resolved from that resolved device (`bfloat16` on CUDA,
+  `float32` on CPU) — deliberately **not** the checkpoint's own declared dtype,
+  which is often `float32` and would load a 7B model at ~28 GB. Pass
+  `"float16"`/`"bfloat16"` explicitly for a half-precision copy regardless of
+  device. Setup failures and generation failures (OOM, unsupported dtype) all
+  raise `LLMError`, so they degrade exactly like a failed API call. `unload()`
+  frees the weights.
+
+The API temperature is an implementation choice; the reference does not state
+one. Results cannot be validated against the paper's tables with the local
+data.
 
 The LLM re-ranker sees the mention, context, candidate CUIs, preferred names
 and surface forms. The `Concept` schema and KB loader have no definition
@@ -146,10 +165,19 @@ python -m GRF.cli normalize --index index/ --mention "bệnh phong" \
 python -m GRF.cli evaluate --data data/test_fixed_verified_gold_revised.jsonl \
   --data-as-kb --encoder cambridgeltl/SapBERT-from-PubMedBERT-fulltext \
   --feedback-types "" --limit 10
+
+# Same, with a local HuggingFace model for feedback and re-ranking.
+python -m GRF.cli evaluate --data data/test_fixed_verified_gold_revised.jsonl \
+  --data-as-kb --encoder cambridgeltl/SapBERT-from-PubMedBERT-fulltext \
+  --feedback-types def --rerank llm --llm-backend local \
+  --llm-model Qwen/Qwen2.5-7B-Instruct --llm-device cuda --limit 10
 ```
 
-Set `OPENAI_API_KEY`/`OPENAI_BASE_URL` for `def`/`syn`/`std` feedback and the
-LLM re-ranker. Without a reachable LLM, feedback failures degrade to `Q_0`
+For the API backend, set `OPENAI_API_KEY`/`OPENAI_BASE_URL` for
+`def`/`syn`/`std` feedback and the LLM re-ranker. For the local backend, pass
+`--llm-backend local --llm-model <hf-id-or-path>` (plus `--llm-device`,
+`--llm-dtype`); nothing else is needed and no key is read. Without a usable
+LLM, feedback failures degrade to `Q_0`
 and LLM re-rank failures fall back to top-1, both recorded in
 `Response.debug`. Indexes built by the CLI store
 `encoder_info={"model": <huggingface id>}`; loading a prebuilt index with a
@@ -178,12 +206,25 @@ which is in [`source/notebooks/baseline/`](../notebooks/baseline/):
 
 Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
 data loading, re-ranking) drives a `tqdm` bar through the library's
-`progress_callback`; all four notebooks install `tqdm` explicitly.
+`progress_callback`; all four notebooks install `tqdm` explicitly, and
+`retrieval`/`e2e` also install `transformers` for the local LLM backend
+(`baseline` installs neither — it uses no LLM).
 
 With `DEVICE = "cuda"`, `retrieval.ipynb` and `baseline.ipynb` keep one GPU copy of the index
 (`VectorIndex.use_gpu`) and scores queries with a batched matrix multiply; only
 rows at or above each k-th score return to CPU. If the copy does not fit, it
-logs a warning and uses the CPU scan. Each notebook ends by dropping its large
-objects (`gc.collect`); `build_KB`, `retrieval` and `baseline` also empty the
-CUDA cache (`release_gpu`, `torch.cuda.empty_cache`), while `e2e` has no GPU
-state.
+logs a warning and uses the CPU scan.
+
+**GPU residents.** `retrieval.ipynb` with a local feedback model holds three
+CUDA residents at once — the SapBERT encoder, the index copy, and the local
+LLM — and the LLM is loaded last, so an out-of-memory load shows up as
+per-kind feedback failures (silent degradation to `Q_0`) rather than a crash.
+On a 16 GB Colab GPU use a small model or `LLM_LOCAL_DEVICE = "cpu"`; a CPU
+feedback model costs VRAM nothing and only slows the feedback stage.
+`e2e.ipynb` holds only the re-ranker's model, but that model is still GPU state
+when `LLM_BACKEND = "local"` and `LLM_LOCAL_DEVICE = "cuda"`.
+
+Each notebook ends by dropping its large objects (`gc.collect`) and calling
+`unload()` on a local model; `build_KB`, `retrieval` and `baseline` also empty
+the CUDA cache (`release_gpu`, `torch.cuda.empty_cache`), and `e2e` does the
+same when a GPU is present.
