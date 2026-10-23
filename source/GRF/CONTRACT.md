@@ -124,8 +124,7 @@ other observed terms, `source_kb=None`. Document leakage in its docstring.
 (header case-insensitive): the first concept per CUI is the preferred name,
 later distinct concepts become aliases, and a repeated CUI is folded instead of
 raising. `NaN` is real KB content (the "none/no" concept, e.g. C0549184), not a
-missing value. A row with an empty `concept` (how pandas writes a missing
-value) has no surface form and is skipped; an empty `CUI` is still an error.
+missing value; only an empty field is rejected.
 
 ## common/data.py
 

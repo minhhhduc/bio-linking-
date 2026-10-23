@@ -142,11 +142,8 @@ def load_concepts_csv(
     concepts become aliases in first-appearance order, so a repeated CUI does
     not abort a large KB load.  A concept spelt ``"NaN"`` is real KB content
     (the "none/no" concept, e.g. C0549184), not a missing value, and is kept
-    like any other concept.  A row with an empty ``concept`` field — how pandas
-    writes a missing value — carries no surface form to index, so it is skipped
-    instead of aborting a multi-million-row load; an empty ``CUI`` is still an
-    error.  ``progress_callback(done, total)`` is called after every non-blank
-    row, including skipped ones, so it tracks the caller's row count; pass
+    like any other concept.  Only a genuinely empty field is rejected.
+    ``progress_callback(done, total)`` is called after each parsed row; pass
     ``total`` when the caller already counted the rows.
     """
     if progress_callback is not None and not callable(progress_callback):
@@ -182,16 +179,10 @@ def load_concepts_csv(
                     f"{path}:{lineno}: expected 2 columns, got {len(row)}"
                 )
             cui, concept = row
-            if not concept.strip():
-                # pandas writes NaN as an empty field; a row without a concept
-                # name has no surface form, so skip it rather than fail a
-                # multi-million-row KB.  Still count it for the progress bar.
-                done += 1
-                if progress_callback is not None:
-                    progress_callback(done, total)
-                continue
             if not cui.strip():
                 raise ValueError(f"{path}:{lineno}: 'CUI' must be non-empty")
+            if not concept.strip():
+                raise ValueError(f"{path}:{lineno}: 'concept' must be non-empty")
             cui = unicodedata.normalize("NFC", cui.strip())
             concept = unicodedata.normalize("NFC", concept.strip())
 
