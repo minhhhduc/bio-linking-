@@ -156,8 +156,9 @@ class VectorIndex:
         surfaces = [entry[1] for entry in entries]
         source_kbs = [entry[2] for entry in entries]
 
-        batches: list[np.ndarray] = []
         expected_dim: int | None = None
+        output: np.ndarray | None = None
+        done = 0
         for start in range(0, len(surfaces), batch_size):
             chunk = surfaces[start : start + batch_size]
             encoded = np.asarray(encoder.encode(chunk), dtype=np.float32)
@@ -168,16 +169,20 @@ class VectorIndex:
                 )
             if expected_dim is None:
                 expected_dim = int(encoded.shape[1])
+                # Preallocate once so a multi-million-row KB is not held twice.
+                output = np.empty(
+                    (len(surfaces), expected_dim), dtype=np.float32
+                )
             elif encoded.shape[1] != expected_dim:
                 raise ValueError("encoder returned inconsistent dimensions")
-            batches.append(encoded)
+            output[done : done + len(chunk)] = encoded
+            done += len(chunk)
             if progress_callback is not None:
-                progress_callback(
-                    min(start + len(chunk), len(surfaces)), len(surfaces)
-                )
+                progress_callback(done, len(surfaces))
 
+        assert output is not None  # entries is non-empty, so the loop ran once
         return cls(
-            np.concatenate(batches, axis=0),
+            output,
             cuis,
             surfaces,
             source_kbs,
