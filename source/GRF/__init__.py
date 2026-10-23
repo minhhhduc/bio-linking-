@@ -41,7 +41,12 @@ from .feedback import (
 from .fusion import component_weights, interpolate_vectors, rrf_scores
 from .hf_llm import TransformersChatClient
 from .index import VectorIndex
-from .kb import concepts_from_dataset, load_concepts_jsonl, surface_entries
+from .kb import (
+    concepts_from_dataset,
+    load_concepts_csv,
+    load_concepts_jsonl,
+    surface_entries,
+)
 from .llm import LLMClient, LLMError, OpenAICompatibleClient
 from .pipeline import EntityLinker
 from .rerank import (
@@ -106,6 +111,7 @@ __all__ = [
     "interpolate_vectors",
     "load_bel_jsonl",
     "load_candidates",
+    "load_concepts_csv",
     "load_concepts_jsonl",
     "make_requests",
     "metrics_from_responses",

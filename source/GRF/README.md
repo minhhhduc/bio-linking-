@@ -9,7 +9,7 @@ results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 
 | Arch. | Responsibility | Module | Reference |
 | --- | --- | --- | --- |
-| C1 | KB loader/parser → `Concept(cui, name, aliases)` | `common/kb.py` (`load_concepts_jsonl`, `concepts_from_dataset`) | §2 |
+| C1 | KB loader/parser → `Concept(cui, name, aliases)` | `common/kb.py` (`load_concepts_jsonl`, `load_concepts_csv`, `concepts_from_dataset`) | §2 |
 | C2 | Homonym rewriting `a + " (" + N_c + ")"` | `common/kb.py` (`surface_entries`) | §3 |
 | C3 | Encoder `E(·)` (BioSyn/SapBERT) | `common/encoder.py` | §3, §5 |
 | C4 | Exact cosine vector index, one entry per surface form; directory (`save`/`load`) or single-file `.npz` (`save_npz`/`load_npz`) persistence | `common/index.py` | §3, §4.2, §5.1 |
@@ -189,11 +189,13 @@ the untruncated concept ranking, so `top_k_concept` no longer caps it; keep
 ## Notebooks
 
 No tests are shipped. The pipeline has never been executed. Colab notebooks live
-in [`source/notebooks/GRF/`](../notebooks/GRF/), except the dense baseline,
-which is in [`source/notebooks/baseline/`](../notebooks/baseline/):
+in [`source/notebooks/`](../notebooks/): the KB builder is in `common/`, the
+GRF notebooks are in `GRF/`, and the dense baseline is in `baseline/`:
 
-- `build_KB.ipynb` embeds the KB JSONL from Google Drive into the single-file
-  artifact.
+- `common/build_KB.ipynb` embeds the two-column KB CSV (`CUI,concept`) from
+  Google Drive into the single-file artifact. A concept named `NaN` (for
+  example C0549184) is the source KB's "none/no" answer and is embedded like
+  any other row.
 - `retrieval.ipynb` loads the KB data, the artifact and the gold data from
   Drive, runs candidate retrieval, reports R@1/R@5, and saves every mention's
   candidates to one JSONL file (`candidates.save_candidates`).

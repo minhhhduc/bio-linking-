@@ -9,6 +9,7 @@ several distinct CUIs is rewritten for every alias occurrence as
 
 from __future__ import annotations
 
+import csv
 import json
 import unicodedata
 from collections import Counter
@@ -129,6 +130,77 @@ def load_concepts_jsonl(
             if progress_callback is not None:
                 progress_callback(len(concepts), total)
     return concepts
+
+
+def load_concepts_csv(
+    path: str | Path, *, progress_callback=None, total: int | None = None
+) -> list[Concept]:
+    """Load a two-column ``CUI,concept`` CSV into concepts.
+
+    The header must be ``CUI,concept`` (case-insensitive).  Rows are grouped by
+    CUI: the first ``concept`` is the preferred name and later distinct
+    concepts become aliases in first-appearance order, so a repeated CUI does
+    not abort a large KB load.  A concept spelt ``"NaN"`` is real KB content
+    (the "none/no" concept, e.g. C0549184), not a missing value, and is kept
+    like any other concept.  Only a genuinely empty field is rejected.
+    ``progress_callback(done, total)`` is called after each parsed row; pass
+    ``total`` when the caller already counted the rows.
+    """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
+    if total is not None and (
+        isinstance(total, bool) or not isinstance(total, int) or total < 0
+    ):
+        raise ValueError("total must be a non-negative integer or None")
+
+    path = Path(path)
+    order: list[str] = []
+    names: dict[str, str] = {}
+    aliases: dict[str, list[str]] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError(
+                f"{path}: empty CSV; expected a 'CUI,concept' header"
+            ) from None
+        if [column.strip().lower() for column in header] != ["cui", "concept"]:
+            raise ValueError(
+                f"{path}: expected header 'CUI,concept', got {header!r}"
+            )
+
+        done = 0
+        for lineno, row in enumerate(reader, 2):
+            if not row or all(not field.strip() for field in row):
+                continue
+            if len(row) != 2:
+                raise ValueError(
+                    f"{path}:{lineno}: expected 2 columns, got {len(row)}"
+                )
+            cui, concept = row
+            if not cui.strip():
+                raise ValueError(f"{path}:{lineno}: 'CUI' must be non-empty")
+            if not concept.strip():
+                raise ValueError(f"{path}:{lineno}: 'concept' must be non-empty")
+            cui = unicodedata.normalize("NFC", cui.strip())
+            concept = unicodedata.normalize("NFC", concept.strip())
+
+            if cui in names:
+                if concept != names[cui] and concept not in aliases[cui]:
+                    aliases[cui].append(concept)
+            else:
+                order.append(cui)
+                names[cui] = concept
+                aliases[cui] = []
+            done += 1
+            if progress_callback is not None:
+                progress_callback(done, total)
+
+    return [
+        Concept(cui=cui, name=names[cui], aliases=tuple(aliases[cui]), source_kb=None)
+        for cui in order
+    ]
 
 
 def concepts_from_dataset(

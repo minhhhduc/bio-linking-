@@ -21,7 +21,12 @@ from .data import (
 from .encoder import Encoder, SentenceTransformerEncoder
 from .evaluator import Metrics, metrics_from_responses
 from .index import SINGLE_FILE_FORMAT, VectorIndex
-from .kb import concepts_from_dataset, load_concepts_jsonl, surface_entries
+from .kb import (
+    concepts_from_dataset,
+    load_concepts_csv,
+    load_concepts_jsonl,
+    surface_entries,
+)
 from .schemas import (
     Candidate,
     Concept,
@@ -55,6 +60,7 @@ __all__ = [
     "concepts_from_dataset",
     "load_bel_jsonl",
     "load_candidates",
+    "load_concepts_csv",
     "load_concepts_jsonl",
     "metrics_from_responses",
     "save_candidates",

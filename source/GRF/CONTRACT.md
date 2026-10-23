@@ -95,6 +95,8 @@ empty `target_kb`/`llm_model`, `index_kb` empty string.
 ```python
 def load_concepts_jsonl(path, *, progress_callback=None,
                         total: int | None = None) -> list[Concept]
+def load_concepts_csv(path, *, progress_callback=None,
+                      total: int | None = None) -> list[Concept]
 def concepts_from_dataset(records) -> list[Concept]
 def surface_entries(concepts, *, progress_callback=None
                     ) -> list[tuple[str, str, str | None]]
@@ -117,6 +119,12 @@ concept so a rewrite cannot create a duplicate index triple.
 `concepts_from_dataset` builds a surrogate KB from the gold file: name = most
 frequent `vi_term` per CUI (ties resolved by first appearance), aliases = the
 other observed terms, `source_kb=None`. Document leakage in its docstring.
+
+`load_concepts_csv` reads the user-supplied two-column `CUI,concept` CSV
+(header case-insensitive): the first concept per CUI is the preferred name,
+later distinct concepts become aliases, and a repeated CUI is folded instead of
+raising. `NaN` is real KB content (the "none/no" concept, e.g. C0549184), not a
+missing value; only an empty field is rejected.
 
 ## common/data.py
 
