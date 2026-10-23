@@ -140,11 +140,12 @@ def load_concepts_csv(
     The header must be ``CUI,concept`` (case-insensitive).  Rows are grouped by
     CUI: the first ``concept`` is the preferred name and later distinct
     concepts become aliases in first-appearance order, so a repeated CUI does
-    not abort a large KB load.  A concept spelt ``"NaN"`` is real KB content
-    (the "none/no" concept, e.g. C0549184), not a missing value, and is kept
-    like any other concept.  Only a genuinely empty field is rejected.
-    ``progress_callback(done, total)`` is called after each parsed row; pass
-    ``total`` when the caller already counted the rows.
+    not abort a large KB load.  A concept spelt ``"None"`` is real KB content
+    (the "none/no" concept, C0549184), not a missing value.  An export written
+    by pandas with default NA handling blanks that name, so an empty ``concept``
+    on C0549184 is restored to ``"None"``; an empty concept on any other CUI is
+    still rejected.  ``progress_callback(done, total)`` is called after each
+    parsed row; pass ``total`` when the caller already counted the rows.
     """
     if progress_callback is not None and not callable(progress_callback):
         raise ValueError("progress_callback must be callable or None")
@@ -182,7 +183,17 @@ def load_concepts_csv(
             if not cui.strip():
                 raise ValueError(f"{path}:{lineno}: 'CUI' must be non-empty")
             if not concept.strip():
-                raise ValueError(f"{path}:{lineno}: 'concept' must be non-empty")
+                # pandas writes the literal name "None" as an empty field with
+                # default NA handling.  Only the "none/no" concept is known to
+                # be blanked that way; every other empty field is still an
+                # error, so nothing else is silently renamed.
+                if cui.strip() == "C0549184":
+                    concept = "None"
+                else:
+                    raise ValueError(
+                        f"{path}:{lineno}: 'concept' must be non-empty "
+                        f"for CUI {cui.strip()!r}"
+                    )
             cui = unicodedata.normalize("NFC", cui.strip())
             concept = unicodedata.normalize("NFC", concept.strip())
 
