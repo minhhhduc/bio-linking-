@@ -7,9 +7,11 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-TOKEN_PATTERN = r"\w+|[^\w\s]"
+TOKEN_PATTERN = r"\S+"
 TOKEN_RE = re.compile(TOKEN_PATTERN)
 TAG_RE = re.compile(r"</?e(\d+)>")
+TAG_OPEN_AFTER_TEXT_RE = re.compile(r"(?<=\S)(<e\d+>)")
+TAG_CLOSE_BEFORE_TEXT_RE = re.compile(r"(</e\d+>)(?=\S)")
 FENCED_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 THINKING_RE = re.compile(r" thinking.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -64,7 +66,11 @@ class ParsedSentence:
 
 
 def tokenize_en(text: str) -> TokenizedSentence:
-    """Tokenize câu EN bằng regex bắt buộc, giữ char offset."""
+    """Tokenize câu EN theo whitespace, giữ char offset.
+
+    Cùng quy ước với gold VI (``context.split()``), để file output có đúng
+    format và ``" ".join(tokens[start:end+1]) == term``.
+    """
 
     matches = list(TOKEN_RE.finditer(text))
     return TokenizedSentence(
@@ -146,6 +152,12 @@ def parse_tagged(tagged: str) -> ParsedSentence:
     """
 
     tagged = unicodedata.normalize("NFC", tagged)
+    tagged = " ".join(tagged.split())
+    # Tách dấu câu dính vào tag thành token riêng, để char span của term
+    # trùng biên token whitespace (ví dụ "virus:" -> "virus :").
+    tagged = TAG_CLOSE_BEFORE_TEXT_RE.sub(r"\1 ", tagged)
+    tagged = TAG_OPEN_AFTER_TEXT_RE.sub(r" \1", tagged)
+    tagged = " ".join(tagged.split())
     parts: list[str] = []
     stack: list[tuple[int, int]] = []
     seen_open: set[int] = set()

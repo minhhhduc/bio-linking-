@@ -24,8 +24,7 @@ from .parse import (
     parse_tagged,
 )
 from .tagging import Entity, TaggedSentence, TaggingError, attach_tags
-from .umls_hints import load_hints
-from .validate import SapBertMatcher, validate_translation
+from .validate import validate_translation
 
 LOGGER = logging.getLogger(__name__)
 OOM_SENTINEL = object()
@@ -49,16 +48,12 @@ class Record:
 class PipelineConfig:
     model: str
     batch_size: int
-    umls_path: str
-    sap_thr: float
     input_path: str
     output_path: str
     review_path: str
     max_new_tokens: int = 2048
     max_seq_len: int | None = None
     dtype: str = "bfloat16"
-    umls_cache: str | None = None
-    sap_model: str | None = None
     max_retries: int = 2
     resume: bool = True
     limit: int | None = None
@@ -220,31 +215,17 @@ def _resume_keys(output_path: str | Path, manifest_path: str | Path) -> set[tupl
             "Move/delete both and rerun."
         )
 
-    output_indices: set[int] = set()
-    with output.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise PipelineError(f"invalid output row in {output}") from exc
-            index = row.get("record_index") if isinstance(row, dict) else None
-            if not _is_int(index):
-                raise PipelineError(
-                    f"{output} has a row without integer record_index; "
-                    "move/delete it and rerun"
-                )
-            if index in output_indices:
-                raise PipelineError(f"duplicate record_index {index} in {output}")
-            output_indices.add(index)
+    output_rows = sum(
+        1 for line in output.open("r", encoding="utf-8") if line.strip()
+    )
 
     keys: set[tuple[int, str]] = set()
-    manifest_indices: set[int] = set()
+    manifest_rows = 0
     with manifest.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
+            manifest_rows += 1
             try:
                 item = json.loads(line)
                 index = item["index"]
@@ -253,15 +234,10 @@ def _resume_keys(output_path: str | Path, manifest_path: str | Path) -> set[tupl
                 raise PipelineError(f"invalid resume manifest line: {line!r}") from exc
             if not _is_int(index) or not isinstance(digest, str):
                 raise PipelineError(f"invalid resume manifest entry: {item!r}")
-            if index not in output_indices:
-                raise PipelineError(
-                    f"manifest index {index} is missing from {output}"
-                )
-            manifest_indices.add(index)
             keys.add((index, digest))
-    if output_indices != manifest_indices:
+    if output_rows != manifest_rows:
         raise PipelineError(
-            f"{output} and {manifest} disagree on completed indices; "
+            f"{output} has {output_rows} rows but {manifest} has {manifest_rows}; "
             "a crash may have left a partial row. Move/delete both or use --no-resume."
         )
     return keys
@@ -356,15 +332,14 @@ def _translated_row(
                 "cui": source.cui,
                 "icd10": list(source.icd10),
                 "label": source.label,
-                "en_term": translated.en_term,
-                "en_start_token_idx": translated.en_start_token_idx,
-                "en_end_token_idx": translated.en_end_token_idx,
+                "vi_term": translated.en_term,
+                "vi_start_token_idx": translated.en_start_token_idx,
+                "vi_end_token_idx": translated.en_end_token_idx,
             }
         )
     return {
-        "record_index": record.index,
         "entities": entities,
-        "en_sentence_str": clean_sentence,
+        "vi_sentence_str": clean_sentence,
     }
 
 
@@ -399,7 +374,6 @@ def run_pipeline(
     config: PipelineConfig,
     *,
     backend=None,
-    sap_matcher: SapBertMatcher | None = None,
 ) -> RunStats:
     """Chạy pipeline; không gọi API ngoài, không tự tải model."""
 
@@ -466,13 +440,6 @@ def run_pipeline(
             else:
                 ready.append(record)
 
-        cuis = {entity.cui for record in ready for entity in record.entities}
-        hints = load_hints(
-            config.umls_path,
-            cuis,
-            cache_path=config.umls_cache,
-        )
-
         if ready:
             if backend is None:
                 backend = HFBackend(
@@ -481,16 +448,6 @@ def run_pipeline(
                     max_seq_len=config.max_seq_len,
                     dtype=config.dtype,
                 )
-            if sap_matcher is None:
-                candidate = SapBertMatcher(config.sap_model, config.sap_thr)
-                if candidate.available:
-                    sap_matcher = candidate
-                else:
-                    LOGGER.warning(
-                        "SapBERT unavailable (no local model or missing "
-                        "sentence-transformers); CUI validation is exact-only"
-                    )
-                    sap_matcher = None
 
         state = {"batch_size": max(1, config.batch_size)}
         feedback: dict[int, str] = {}
@@ -511,7 +468,6 @@ def run_pipeline(
                     build_prompt(
                         record.entities,
                         tagged[record.index].vi_tagged,
-                        hints,
                         feedback.get(record.index, ""),
                     )
                     for record in chunk
@@ -567,16 +523,10 @@ def run_pipeline(
                             attempts=attempt_log.get(record.index, []),
                         )
                         continue
-                    retryable = True
                     try:
                         payload = parse_model_json(str(raw))
                         parsed = parse_tagged(str(payload["en_tagged"]))
-                        validation = validate_translation(
-                            record.entities,
-                            parsed,
-                            hints,
-                            sap_matcher,
-                        )
+                        validation = validate_translation(record.entities, parsed)
                     except (ModelOutputError, TagParseError) as exc:
                         reasons = [f"{exc.code}: {exc.detail}"]
                     except Exception as exc:
@@ -594,10 +544,9 @@ def run_pipeline(
                                 stats.after_retry += 1
                             continue
                         reasons = list(validation.reasons)
-                        retryable = validation.retryable
 
                     attempt_entry["reasons"] = reasons
-                    if attempt < config.max_retries and retryable:
+                    if attempt < config.max_retries:
                         feedback[record.index] = format_retry_feedback(reasons)
                         next_ready.append(record)
                     else:

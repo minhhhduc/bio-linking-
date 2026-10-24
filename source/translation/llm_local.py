@@ -17,22 +17,21 @@ PROMPT_TEMPLATE = """You are a medical translator. Translate the Vietnamese sent
 while preserving entity annotations.
 
 The sentence contains tags <e0>...</e0>, <e1>...</e1>, ... Each tag marks a
-medical entity linked to a UMLS concept.
+medical entity of the given type.
 
 RULES
 1. Output the English sentence with every tag kept EXACTLY ONCE, same id,
    wrapped around the English equivalent of that entity.
 2. Translate according to the sentence context (natural, accurate medical English).
-3. Each tagged phrase must be one contiguous phrase and must denote the given
-   UMLS concept. Prefer one of the listed English names; inflection or word
-   order may change if the context requires.
+3. Each tagged phrase must be one contiguous phrase that translates that
+   entity; inflection or word order may change to fit the sentence.
 4. Tag ONLY the term itself, no articles/prepositions/neighbors
    ("a <e1>virus</e1>", not "<e1>a virus</e1>").
 5. Do NOT merge two entities into one word. If natural English would merge them
    (e.g. "viral meningitis"), rewrite so each concept stays separate
    ("meningitis caused by a virus").
 6. Do not add, drop, reorder or nest tags. No other markup.
-7. Do not translate CUI, ICD codes, or labels.
+7. Do not translate the codes or labels.
 
 ENTITIES
 {entities}
@@ -80,30 +79,22 @@ def format_retry_feedback(reasons: list[str] | tuple[str, ...]) -> str:
 
 def build_entities_block(
     entities: list[Entity] | tuple[Entity, ...],
-    hints: dict[str, tuple[str, ...]],
 ) -> str:
     if not entities:
         return "(no entities in this sentence)"
-    lines: list[str] = []
-    for index, entity in enumerate(entities):
-        names = hints.get(entity.cui, ())
-        english = "; ".join(names) if names else "(no English name found)"
-        icd10 = ", ".join(entity.icd10) if entity.icd10 else "-"
-        lines.append(
-            f"- e{index}: {entity.vi_term!r} | CUI={entity.cui} | "
-            f"ICD10={icd10} | label={entity.label} | EN names: {english}"
-        )
-    return "\n".join(lines)
+    return "\n".join(
+        f"- e{index}: {entity.vi_term!r} | label={entity.label}"
+        for index, entity in enumerate(entities)
+    )
 
 
 def build_prompt(
     entities: list[Entity] | tuple[Entity, ...],
     vi_tagged: str,
-    hints: dict[str, tuple[str, ...]],
     retry_feedback: str = "",
 ) -> str:
     return PROMPT_TEMPLATE.format(
-        entities=build_entities_block(entities, hints),
+        entities=build_entities_block(entities),
         vi_tagged=vi_tagged,
         retry_feedback=retry_feedback,
     )
