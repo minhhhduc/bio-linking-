@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .llm_local import (
+    HFBackend,
     build_prompt,
     format_retry_feedback,
     is_oom,
-    make_backend,
 )
 from .parse import (
     ModelOutputError,
@@ -48,15 +48,15 @@ class Record:
 @dataclass(frozen=True)
 class PipelineConfig:
     model: str
-    backend: str
     batch_size: int
-    gpu_mem_util: float
-    tp: int
     umls_path: str
     sap_thr: float
     input_path: str
     output_path: str
     review_path: str
+    max_new_tokens: int = 2048
+    max_seq_len: int | None = None
+    dtype: str = "bfloat16"
     umls_cache: str | None = None
     sap_model: str | None = None
     max_retries: int = 2
@@ -475,11 +475,11 @@ def run_pipeline(
 
         if ready:
             if backend is None:
-                backend = make_backend(
-                    config.backend,
+                backend = HFBackend(
                     config.model,
-                    gpu_mem_util=config.gpu_mem_util,
-                    tp=config.tp,
+                    max_new_tokens=config.max_new_tokens,
+                    max_seq_len=config.max_seq_len,
+                    dtype=config.dtype,
                 )
             if sap_matcher is None:
                 candidate = SapBertMatcher(config.sap_model, config.sap_thr)

@@ -16,15 +16,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="Dịch NER y khoa VI -> EN bằng model Qwen local."
     )
     parser.add_argument("--model", required=True, help="đường dẫn model Qwen local")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument(
-        "--backend",
-        choices=("vllm", "hf", "llamacpp"),
-        default="hf",
-        help="backend local (mặc định: hf)",
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="prompt + generation cap; mặc định lấy max_position_embeddings của model",
     )
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--gpu-mem-util", type=float, default=0.90)
-    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="bfloat16",
+        help="kiểu weight khi load bằng transformers",
+    )
     parser.add_argument("--umls", required=True, help="đường dẫn MRCONSO.RRF")
     parser.add_argument("--sap-thr", type=float, default=0.85)
     parser.add_argument("--in", dest="input_path", required=True, help="JSONL nguồn")
@@ -56,14 +61,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.batch_size < 1:
         parser.error("--batch-size must be >= 1")
+    if args.max_new_tokens < 1:
+        parser.error("--max-new-tokens must be >= 1")
+    if args.max_seq_len is not None and args.max_seq_len < 1:
+        parser.error("--max-seq-len must be >= 1")
     if args.max_retries < 0:
         parser.error("--max-retries must be >= 0")
-    if not 0.0 < args.gpu_mem_util <= 1.0:
-        parser.error("--gpu-mem-util must be in (0, 1]")
     if not 0.0 < args.sap_thr <= 1.0:
         parser.error("--sap-thr must be in (0, 1]")
-    if args.tp < 1:
-        parser.error("--tp must be >= 1")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be >= 1")
 
@@ -109,10 +114,10 @@ def main(argv: list[str] | None = None) -> int:
 
     config = PipelineConfig(
         model=str(model_path),
-        backend=args.backend,
         batch_size=args.batch_size,
-        gpu_mem_util=args.gpu_mem_util,
-        tp=args.tp,
+        max_new_tokens=args.max_new_tokens,
+        max_seq_len=args.max_seq_len,
+        dtype=args.dtype,
         umls_path=str(umls_path),
         sap_thr=args.sap_thr,
         input_path=str(input_path),

@@ -1,12 +1,11 @@
-"""Backend model local (vLLM / transformers / llama-cpp) và prompt dịch.
+"""Backend transformers local và prompt dịch.
 
 Không import thư viện nặng ở module level để ``--help`` và các phần không dùng
-model vẫn chạy được. Không có API ngoài, không tự tải model.
+model vẫn chạy được. Không có API ngoài, không tự tải model, không lượng tử hoá.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
@@ -48,20 +47,9 @@ Vietnamese: {vi_tagged}
 
 Return JSON only: {{"en_tagged": "<tagged English sentence>"}}"""
 
-JSON_SCHEMA = {
-    "type": "object",
-    "properties": {"en_tagged": {"type": "string"}},
-    "required": ["en_tagged"],
-    "additionalProperties": False,
-}
-
 
 class BackendError(RuntimeError):
     """Backend không khởi tạo hoặc sinh lỗi không phải OOM."""
-
-
-class OOMError(RuntimeError):
-    """Batch quá lớn; pipeline sẽ giảm batch và chạy lại."""
 
 
 def is_oom(exc: BaseException) -> bool:
@@ -151,32 +139,41 @@ def _apply_chat_template(tokenizer, prompt: str) -> str:
 
 
 class HFBackend:
-    """transformers + generate, batch thật."""
+    """transformers + generate, batch thật, full precision."""
+
+    DTYPES = ("float16", "bfloat16", "float32")
 
     def __init__(
         self,
         model: str,
         *,
-        gpu_mem_util: float = 0.90,
-        tp: int = 1,
+        max_new_tokens: int = 2048,
+        max_seq_len: int | None = None,
+        dtype: str = "bfloat16",
     ) -> None:
         if not Path(model).exists():
             raise BackendError(f"model path not found: {model}")
+        if dtype not in self.DTYPES:
+            raise BackendError(
+                f"unsupported dtype {dtype!r}; choose one of {self.DTYPES}"
+            )
+        if max_new_tokens < 1:
+            raise BackendError("max_new_tokens must be >= 1")
+        if max_seq_len is not None and max_seq_len < 1:
+            raise BackendError("max_seq_len must be >= 1 or None")
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as exc:
-            raise BackendError(
-                "hf backend requires torch and transformers"
-            ) from exc
+            raise BackendError("requires torch and transformers") from exc
 
         self.torch = torch
+        self.max_new_tokens = max_new_tokens
+        self.max_seq_len = max_seq_len
         self.cuda = torch.cuda.is_available()
         self.device = "cuda" if self.cuda else "cpu"
-        if self.cuda and tp != 1:
-            LOGGER.warning("HF backend does not implement tensor parallelism; --tp ignored")
-        if gpu_mem_util != 0.90:
-            LOGGER.warning("HF backend does not enforce --gpu-mem-util")
+        if not self.cuda:
+            LOGGER.warning("torch is CPU-only; Qwen 27B needs a GPU in practice")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
@@ -187,11 +184,7 @@ class HFBackend:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        dtype = torch.float16 if self.cuda else torch.bfloat16
-        if not self.cuda:
-            LOGGER.warning(
-                "torch is CPU-only; Qwen 27B needs a GPU in practice"
-            )
+        torch_dtype = getattr(torch, dtype)
         kwargs = {
             "local_files_only": True,
             "trust_remote_code": False,
@@ -199,11 +192,11 @@ class HFBackend:
         try:
             # transformers >= 4.56 dùng `dtype`; bản cũ dùng `torch_dtype`.
             self.model = AutoModelForCausalLM.from_pretrained(
-                model, dtype=dtype, **kwargs
+                model, dtype=torch_dtype, **kwargs
             )
         except TypeError:
             self.model = AutoModelForCausalLM.from_pretrained(
-                model, torch_dtype=dtype, **kwargs
+                model, torch_dtype=torch_dtype, **kwargs
             )
         self.model.to(self.device)
         self.model.eval()
@@ -218,17 +211,19 @@ class HFBackend:
         )
         encoded = {key: value.to(self.device) for key, value in encoded.items()}
         input_length = encoded["input_ids"].shape[1]
-        max_positions = getattr(self.model.config, "max_position_embeddings", None)
-        if max_positions and input_length + 512 > max_positions:
+        limit = self.max_seq_len
+        if limit is None:
+            limit = getattr(self.model.config, "max_position_embeddings", None)
+        if limit and input_length + self.max_new_tokens > limit:
             raise BackendError(
-                f"prompt is {input_length} tokens; +512 generation exceeds "
-                f"model max_position_embeddings={max_positions}"
+                f"prompt is {input_length} tokens; +{self.max_new_tokens} generation "
+                f"exceeds max_seq_len={limit}"
             )
         with self.torch.inference_mode():
             outputs = self.model.generate(
                 **encoded,
                 do_sample=False,  # temperature = 0
-                max_new_tokens=512,
+                max_new_tokens=self.max_new_tokens,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
         generated = outputs[:, input_length:]
@@ -237,171 +232,3 @@ class HFBackend:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-
-
-class VLLMBackend:
-    """vLLM offline ``LLM`` + guided JSON nếu phiên bản hỗ trợ."""
-
-    def __init__(
-        self,
-        model: str,
-        *,
-        gpu_mem_util: float = 0.90,
-        tp: int = 1,
-    ) -> None:
-        if not Path(model).exists():
-            raise BackendError(f"model path not found: {model}")
-        try:
-            from vllm import LLM, SamplingParams
-        except ImportError as exc:
-            raise BackendError("vllm backend requires vllm") from exc
-
-        self.SamplingParams = SamplingParams
-        self.llm = LLM(
-            model=model,
-            tensor_parallel_size=tp,
-            gpu_memory_utilization=gpu_mem_util,
-            max_model_len=8192,
-            dtype="bfloat16",
-            trust_remote_code=False,
-        )
-        self.tokenizer = self.llm.get_tokenizer()
-        self.sampling = self._make_sampling()
-
-    def _make_sampling(self):
-        guided = None
-        try:
-            from vllm.sampling_params import GuidedDecodingParams
-
-            try:
-                guided = GuidedDecodingParams(json=JSON_SCHEMA)
-            except TypeError:
-                guided = GuidedDecodingParams(json=json.dumps(JSON_SCHEMA))
-        except (ImportError, TypeError, ValueError) as exc:
-            LOGGER.warning("vLLM GuidedDecodingParams unavailable: %s", exc)
-            guided = None
-
-        if guided is not None:
-            try:
-                return self.SamplingParams(
-                    temperature=0.0,
-                    max_tokens=512,
-                    guided_decoding=guided,
-                )
-            except TypeError:
-                pass
-        try:
-            return self.SamplingParams(
-                temperature=0.0,
-                max_tokens=512,
-                guided_json=JSON_SCHEMA,
-            )
-        except TypeError:
-            LOGGER.warning("vLLM guided JSON unavailable; falling back to regex parse")
-            return self.SamplingParams(temperature=0.0, max_tokens=512)
-
-    def generate_batch(self, prompts: list[str]) -> list[str]:
-        texts = [_apply_chat_template(self.tokenizer, prompt) for prompt in prompts]
-        requests: list[object] = texts
-        try:
-            from vllm.inputs import TokensPrompt
-
-            requests = [
-                TokensPrompt(
-                    prompt_token_ids=self.tokenizer(
-                        text, add_special_tokens=False
-                    )["input_ids"]
-                )
-                for text in texts
-            ]
-        except (ImportError, AttributeError, TypeError):
-            requests = texts
-        outputs = self.llm.generate(requests, self.sampling)
-        return [output.outputs[0].text for output in outputs]
-
-
-class LlamaCppBackend:
-    """llama-cpp-python cho model GGUF."""
-
-    def __init__(
-        self,
-        model: str,
-        *,
-        gpu_mem_util: float = 0.90,
-        tp: int = 1,
-    ) -> None:
-        if not Path(model).exists():
-            raise BackendError(f"model path not found: {model}")
-        if tp != 1:
-            LOGGER.warning("llama.cpp backend does not implement --tp; ignored")
-        if gpu_mem_util != 0.90:
-            LOGGER.warning("llama.cpp backend does not enforce --gpu-mem-util")
-        try:
-            from llama_cpp import Llama, LlamaGrammar
-        except ImportError as exc:
-            raise BackendError("llamacpp backend requires llama-cpp-python") from exc
-
-        self.grammar = None
-        try:
-            self.grammar = LlamaGrammar.from_json_schema(json.dumps(JSON_SCHEMA))
-        except (AttributeError, TypeError, ValueError):
-            LOGGER.warning("llama.cpp JSON grammar unavailable; using response_format")
-
-        try:
-            import torch
-
-            gpu_layers = -1 if torch.cuda.is_available() else 0
-        except ImportError:
-            gpu_layers = -1
-        self.llm = Llama(
-            model_path=model,
-            n_ctx=8192,
-            n_gpu_layers=gpu_layers,
-            verbose=False,
-        )
-
-    def generate_batch(self, prompts: list[str]) -> list[str]:
-        results: list[str] = []
-        for prompt in prompts:
-            kwargs: dict[str, object] = {
-                "temperature": 0.0,
-                "max_tokens": 512,
-            }
-            if self.grammar is not None:
-                kwargs["grammar"] = self.grammar
-            else:
-                kwargs["response_format"] = {"type": "json_object"}
-
-            messages = [{"role": "user", "content": prompt}]
-            try:
-                response = self.llm.create_chat_completion(
-                    messages=messages,
-                    chat_template_kwargs={"enable_thinking": False},
-                    **kwargs,
-                )
-            except TypeError:
-                LOGGER.warning(
-                    "llama.cpp chat_template_kwargs unsupported; thinking may stay on"
-                )
-                response = self.llm.create_chat_completion(messages=messages, **kwargs)
-            message = response["choices"][0]["message"]
-            content = message.get("content") or message.get("reasoning_content") or ""
-            results.append(content)
-        return results
-
-
-def make_backend(
-    name: str,
-    model: str,
-    *,
-    gpu_mem_util: float = 0.90,
-    tp: int = 1,
-):
-    backend = name.lower()
-    if backend == "hf":
-        return HFBackend(model, gpu_mem_util=gpu_mem_util, tp=tp)
-    if backend == "vllm":
-        return VLLMBackend(model, gpu_mem_util=gpu_mem_util, tp=tp)
-    if backend == "llamacpp":
-        return LlamaCppBackend(model, gpu_mem_util=gpu_mem_util, tp=tp)
-    raise BackendError(f"unknown backend: {name}")
