@@ -105,6 +105,11 @@ Request  { mention: string, context: string, feedback_types: string[], n_syn: in
 Response { cui: string, candidates: [{cui, score, surface}], debug: {Q_0, Q_F, ranks} }
 ```
 
+Bản gold tiếng Anh (cho thí nghiệm song ngữ) không do pipeline này sinh ra: nó
+được dịch offline từ gold tiếng Việt, giữ nguyên `cui` / `icd10` / `label` và mọi
+field `vi_*`, chỉ thêm `en_sentence_str`, `en_term` và span `en_*` tương ứng —
+xem [`translate-gold-pipeline.md`](translate-gold-pipeline.md).
+
 ## 5. Luồng xử lý
 
 ### 5.1. Offline — build index
