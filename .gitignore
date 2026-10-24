@@ -18,6 +18,9 @@ dist/
 .coverage
 htmlcov/
 
+# Data (never committed; keep local / Drive copies)
+data/
+
 # Notebooks / logs / artifacts
 .ipynb_checkpoints/
 *.log
