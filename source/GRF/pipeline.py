@@ -127,7 +127,8 @@ class EntityLinker:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def link(self, request: Request) -> Response:
+    def link(self, request: Request, *, q0: np.ndarray | None = None) -> Response:
+        """Link one request. ``q0`` may be precomputed by :meth:`link_batch`."""
         if not isinstance(request, Request):
             raise TypeError("request must be a Request")
         kinds = self._validate_kinds(request.feedback_types)
@@ -140,9 +141,19 @@ class EntityLinker:
                 "feedback_types is non-empty but no feedback_generator was supplied"
             )
 
-        q0 = self._encode_mention_in_context(
-            request.mention, request.context, request.start_token, request.end_token
-        )
+        if q0 is None:
+            q0 = self._encode_mention_in_context(
+                request.mention,
+                request.context,
+                request.start_token,
+                request.end_token,
+            )
+        else:
+            q0 = np.asarray(q0, dtype=np.float64)
+            if q0.shape != (self._encoder.dim,):
+                raise ValueError(
+                    f"q0 must have shape ({self._encoder.dim},), got {q0.shape!r}"
+                )
 
         feedbacks: tuple[Feedback, ...] = ()
         failures: tuple[FeedbackFailure, ...] = ()
@@ -265,9 +276,11 @@ class EntityLinker:
         if progress_callback is not None and not callable(progress_callback):
             raise ValueError("progress_callback must be callable or None")
         items = list(requests)
+        # One batched forward pass for every Q_0 instead of one per request.
+        q0_matrix = self._encode_many_in_context(items)
         responses: list[Response] = []
-        for done, request in enumerate(items, start=1):
-            responses.append(self.link(request))
+        for done, (request, q0) in enumerate(zip(items, q0_matrix), start=1):
+            responses.append(self.link(request, q0=q0))
             if progress_callback is not None:
                 progress_callback(done, len(items))
         return responses
@@ -417,6 +430,28 @@ class EntityLinker:
         if not np.all(np.isfinite(matrix)):
             raise ValueError("encoder returned non-finite values")
         return matrix[0]
+
+    def _encode_many_in_context(self, items: Sequence[Request]) -> np.ndarray:
+        """Batched ``Q_0`` for every request, in one encoder call."""
+        if not items:
+            return np.zeros((0, self._encoder.dim), dtype=np.float64)
+        encode = self._encoder.encode_mention_in_context
+        matrix = np.asarray(
+            encode(
+                [item.mention for item in items],
+                [item.context for item in items],
+                [(item.start_token, item.end_token) for item in items],
+            ),
+            dtype=np.float64,
+        )
+        if matrix.shape != (len(items), self._encoder.dim):
+            raise ValueError(
+                f"encoder must return an ({len(items)}, dim) matrix, got "
+                f"{matrix.shape!r}"
+            )
+        if not np.all(np.isfinite(matrix)):
+            raise ValueError("encoder returned non-finite values")
+        return matrix
 
     @staticmethod
     def _validate_kinds(feedback_types) -> tuple[str, ...]:

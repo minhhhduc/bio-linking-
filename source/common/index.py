@@ -26,7 +26,10 @@ class VectorIndex:
     """One entry per KB surface form; exact cosine scan at query time."""
 
     # Bounds the transient (N, queries) score matrix on the GPU.
-    _GPU_QUERY_CHUNK = 64
+    # Queries per device matmul, capped so the chunk's score matrix stays
+    # around 256 MiB of float32 whatever the index size (T4-friendly).
+    _GPU_QUERY_CHUNK = 256
+    _GPU_SCORE_BUDGET = 1 << 26
 
     def __init__(
         self,
@@ -303,10 +306,13 @@ class VectorIndex:
     ) -> list[list[RetrievalHit]]:
         """Top-k exact cosine hits for every row of ``queries``.
 
-        The ordering rule is identical to calling :meth:`search` per row.
-        With :meth:`use_gpu` active, queries are scored in chunks on the
-        device and only rows at or above each k-th score are copied back to
-        CPU; float32 scores can differ in the last ULPs from the CPU path.
+        Scores are one matrix product, ``R = queries @ self.vectors.T`` (both
+        sides are unit-norm, so the product is cosine), then top-k along each
+        row. The ordering rule is identical to calling :meth:`search` per row.
+        With :meth:`use_gpu` active, the product and ``topk`` run on the device
+        in query chunks and only rows at or above each k-th score are copied
+        back to CPU; float32 scores can differ in the last ULPs from the CPU
+        path.
         """
         self._validate_top_k(top_k)
         self._validate_source_kb(source_kb)
@@ -363,9 +369,12 @@ class VectorIndex:
             else torch.tensor(positions, dtype=torch.long, device=device)
         )
 
+        chunk_rows = max(
+            1, min(self._GPU_QUERY_CHUNK, self._GPU_SCORE_BUDGET // candidate_count)
+        )
         results: list[list[RetrievalHit]] = []
-        for start in range(0, matrix.shape[0], self._GPU_QUERY_CHUNK):
-            chunk = matrix[start : start + self._GPU_QUERY_CHUNK]
+        for start in range(0, matrix.shape[0], chunk_rows):
+            chunk = matrix[start : start + chunk_rows]
             with torch.no_grad():
                 queries = torch.from_numpy(
                     np.ascontiguousarray(chunk)
@@ -377,33 +386,32 @@ class VectorIndex:
                 if rows is not None:
                     scores = scores.index_select(0, rows)
 
-                # Take the threshold and keep every row at or above it, then
-                # apply the CPU order (score desc, cui, surface). Scores can
-                # differ in the last float32 ULPs from BLAS, but the ordering
-                # rule is the same as the CPU path.
-                thresholds = torch.topk(scores, k=columns, dim=0).values[-1]
+                # top-k per query column on the device, then the CPU tie-break
+                # (score desc, cui, surface) on k hits only. Scores can differ
+                # in the last float32 ULPs from BLAS, but the ordering rule is
+                # the same as the CPU path.
+                values, indices = torch.topk(scores, k=columns, dim=0)
+                values = values.cpu().numpy()
+                indices = indices.cpu().numpy()
 
                 for column in range(scores.shape[1]):
-                    selected = torch.nonzero(
-                        scores[:, column] >= thresholds[column], as_tuple=False
-                    ).squeeze(1)
-                    indices = selected.cpu().numpy()
-                    values = scores[selected, column].cpu().numpy()
+                    column_indices = indices[:, column]
+                    column_values = values[:, column]
                     if positions_cpu is not None:
-                        indices = positions_cpu[indices]
+                        column_indices = positions_cpu[column_indices]
                     order = sorted(
-                        range(len(indices)),
+                        range(len(column_indices)),
                         key=lambda j: (
-                            -float(values[j]),
-                            self.cuis[int(indices[j])],
-                            self.surfaces[int(indices[j])],
+                            -float(column_values[j]),
+                            self.cuis[int(column_indices[j])],
+                            self.surfaces[int(column_indices[j])],
                         ),
                     )
                     results.append([
                         RetrievalHit(
-                            cui=self.cuis[int(indices[j])],
-                            surface=self.surfaces[int(indices[j])],
-                            score=float(values[j]),
+                            cui=self.cuis[int(column_indices[j])],
+                            surface=self.surfaces[int(column_indices[j])],
+                            score=float(column_values[j]),
                             rank=rank,
                         )
                         for rank, j in enumerate(order[:top_k], start=1)

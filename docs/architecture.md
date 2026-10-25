@@ -188,6 +188,24 @@ m, s ──▶ E_ctx(m, s) = Q_0     ──▶ Search(Q_0, I)  = R_0
 | Độ trễ | thấp | cao hơn |
 | Khi nào dùng | index lớn, cần nhanh | chất lượng ưu tiên, top-k lớn |
 
+### 5.5. Chấm điểm hàng loạt
+
+Cả hai pipeline dùng chung một phép retrieval; chỉ vector query là khác:
+
+```text
+A ∈ R^{n_surface × d}      # ma trận index, mỗi hàng một surface form
+Q ∈ R^{b × d}              # b query của một batch
+R  = Q · A^T               # (b × n_surface) cosine, vì mọi hàng đã unit-norm
+top-k theo từng hàng của R → candidate của mention đó
+```
+
+`VectorIndex.search_batch` thực hiện đúng phép này. Khi `use_gpu()` bật, phép
+nhân và `topk` chạy trên GPU theo chunk query; chỉ các hàng đạt top-k mới được
+copy về CPU, nên không có vòng lặp Python cho từng mention. Baseline encode hết
+query rồi chấm điểm một lần cho cả tập; GRF encode toàn bộ `Q_0` trong
+`link_batch` bằng một lượt forward, sau đó sinh feedback và chấm điểm cho từng
+request.
+
 ## 6. Tầng prompt (Feedback Generator)
 
 Hợp đồng chung:

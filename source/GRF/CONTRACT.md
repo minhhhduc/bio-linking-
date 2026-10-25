@@ -216,10 +216,12 @@ class VectorIndex:
 Exact cosine scan (architecture permits exact). Deterministic ordering:
 score desc, then `cui`, then `surface`. Empty index -> `[]`, but query
 dimension is checked before the empty short-circuit. `search_batch` scores all
-rows with one matrix multiply, chunked on the GPU to bound the transient
-`(N, queries)` score matrix. With `use_gpu()` the vectors live on CUDA and only
-the rows at or above each query's k-th score cross back to CPU for the same
-score/cui/surface tie-break. The ordering rule matches the CPU path; scores can
+rows with one matrix multiply `Q @ A^T`, chunked on the GPU to bound the
+transient `(N, queries)` score matrix; the chunk size shrinks automatically on
+large indexes (256 MiB score budget). With `use_gpu()` the vectors live on CUDA,
+`topk` runs per query column on the device, and only those k hits cross back to
+CPU for the same score/cui/surface tie-break. The ordering rule matches the CPU
+path; scores can
 differ in the last float32 ULPs because cuBLAS and BLAS reduce differently.
 PyTorch is imported lazily and stays optional; `release_gpu()` clears the device
 copy and cached CUDA memory. Save/load:
