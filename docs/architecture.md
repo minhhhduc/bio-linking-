@@ -119,7 +119,7 @@ Mỗi mention $m$ luôn đi kèm câu chứa nó $s$ (`Request.context`); không
 
 ```text
 text = s[:start] + " [SEP] " + m + " [SEP] " + s[end:]
-Q    = mean-pool( hidden states của các token nằm giữa hai [SEP] ) → L2-normalize
+Q    = normalize( E(m) + mean-pool( hidden states của các token nằm giữa hai [SEP] ) )
 ```
 
 - `start` / `end` là span ký tự của mention trong câu, suy ra từ span token gold
@@ -135,7 +135,9 @@ Q    = mean-pool( hidden states của các token nằm giữa hai [SEP] ) → L2
 - Vector được L2-normalize trước khi so cosine với index.
 
 Phía index KB vẫn encode surface form độc lập ($E(a)$), vì tên khái niệm không
-có ngữ cảnh. Baseline và GRF dùng cùng một hàm
+có ngữ cảnh. Vì vậy $Q$ **cộng thêm $E(m)$** — cùng hàm `encoder.encode` đã dùng
+để dựng row — rồi mới normalize: mean-pool trong ngữ cảnh là một hàm khác, vector
+của nó lệch khỏi đúng row mà nó phải khớp. Baseline và GRF dùng cùng một hàm
 (`SentenceTransformerEncoder.encode_mention_in_context`) cho $Q_0$, nên hai bên
 retrieve trên cùng một biểu diễn và số liệu so sánh được.
 

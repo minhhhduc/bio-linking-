@@ -90,10 +90,16 @@ class SentenceTransformerEncoder:
         """Embed a mention from its own token positions inside its context.
 
         Each context is tokenized as written with ``[SEP]`` markers around the
-        mention (``common.query.mention_query``); the returned vector is the
+        mention (``common.query.mention_query``); the in-context part is the
         mean of the last hidden states between the markers, i.e. of the mention
         tokens only. Words before and after the mention stay context: they
         shape it through attention without being averaged into its vector.
+
+        That mean is added to ``encode(mention)`` before normalising.  The index
+        rows are built with ``encode(surface)``, so a contextual mean alone is
+        a different function and leaves the row it should hit; the mention's
+        own surface embedding keeps the exact-surface signal, and the
+        contextual part still moves the ranking.
 
         ``spans`` holds the gold ``(start_token, end_token)`` per row; ``None``
         falls back to locating the mention string in the sentence.
@@ -192,7 +198,11 @@ class SentenceTransformerEncoder:
         norms = np.linalg.norm(out, axis=1, keepdims=True)
         if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
             raise ValueError("encoder output contains a zero-norm vector")
-        return (out / norms).astype(np.float32, copy=False)
+        blended = out / norms + self.encode(mention_list)
+        blended_norms = np.linalg.norm(blended, axis=1, keepdims=True)
+        if not np.all(np.isfinite(blended_norms)) or np.any(blended_norms <= 0.0):
+            raise ValueError("blended query contains a zero-norm vector")
+        return (blended / blended_norms).astype(np.float32, copy=False)
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         if isinstance(texts, str):

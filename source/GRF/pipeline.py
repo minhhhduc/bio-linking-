@@ -5,9 +5,9 @@ Implements architecture §5.2/§5.3 and reference_abstract §5:
 * Pipeline 1 (``fusion="vector"``): ``Q_GRF`` is the weighted interpolation of
   ``Q_0`` and the feedback vectors, followed by exactly one index scan.
 * ``Q_0`` was formerly ``E(m)``; it now pools the mention's token states in
-  its sentence, with the mention kept in place (``common.query.mention_query``
-  + ``encoder.encode_mention_in_context``), the same query the dense baseline
-  uses.
+  its sentence and adds ``E(m)``, with the mention kept in place
+  (``common.query.mention_query`` + ``encoder.encode_mention_in_context``), the
+  same query the dense baseline uses.
 * Pipeline 2 (``fusion="rrf"``): one scan per query, concept-level rank lists,
   then weighted reciprocal rank fusion.
 * ``feedback_types=()`` degrades to plain dense retrieval (architecture §11).
