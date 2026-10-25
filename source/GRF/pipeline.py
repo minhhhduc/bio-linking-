@@ -4,9 +4,10 @@ Implements architecture §5.2/§5.3 and reference_abstract §5:
 
 * Pipeline 1 (``fusion="vector"``): ``Q_GRF`` is the weighted interpolation of
   ``Q_0`` and the feedback vectors, followed by exactly one index scan.
-* ``Q_0`` was formerly ``E(m)``; it now embeds the mention tokens inside the
-  sentence (``encoder.encode_mention_in_context``), the same query the dense
-  baseline uses.
+* ``Q_0`` was formerly ``E(m)``; it now pools the mention's token states in
+  its sentence, with the mention kept in place (``common.query.mention_query``
+  + ``encoder.encode_mention_in_context``), the same query the dense baseline
+  uses.
 * Pipeline 2 (``fusion="rrf"``): one scan per query, concept-level rank lists,
   then weighted reciprocal rank fusion.
 * ``feedback_types=()`` degrades to plain dense retrieval (architecture §11).
@@ -82,7 +83,8 @@ class EntityLinker:
             raise TypeError("encoder must provide encode() and dim")
         if not hasattr(encoder, "encode_mention_in_context"):
             raise TypeError(
-                "encoder must provide encode_mention_in_context(mentions, contexts)"
+                "encoder must provide encode_mention_in_context(mentions, "
+                "contexts, spans)"
             )
 
         self._index = index
@@ -138,7 +140,9 @@ class EntityLinker:
                 "feedback_types is non-empty but no feedback_generator was supplied"
             )
 
-        q0 = self._encode_mention_in_context(request.mention, request.context)
+        q0 = self._encode_mention_in_context(
+            request.mention, request.context, request.start_token, request.end_token
+        )
 
         feedbacks: tuple[Feedback, ...] = ()
         failures: tuple[FeedbackFailure, ...] = ()
@@ -392,10 +396,19 @@ class EntityLinker:
             raise ValueError("encoder returned non-finite values")
         return matrix
 
-    def _encode_mention_in_context(self, mention: str, context: str) -> np.ndarray:
-        """``Q_0``: the mention's tokens pooled inside its sentence."""
+    def _encode_mention_in_context(
+        self,
+        mention: str,
+        context: str,
+        start_token: int | None,
+        end_token: int | None,
+    ) -> np.ndarray:
+        """``Q_0``: the mention's tokens pooled in place inside its sentence."""
         encode = self._encoder.encode_mention_in_context
-        matrix = np.asarray(encode([mention], [context]), dtype=np.float64)
+        matrix = np.asarray(
+            encode([mention], [context], [(start_token, end_token)]),
+            dtype=np.float64,
+        )
         if matrix.shape != (1, self._encoder.dim):
             raise ValueError(
                 "encoder must return a (1, dim) matrix for one mention, got "

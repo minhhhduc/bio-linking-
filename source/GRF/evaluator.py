@@ -31,6 +31,8 @@ def make_requests(
             context=sample.context,
             feedback_types=tuple(config.feedback_types),
             n_syn=config.n_syn,
+            start_token=sample.start_token,
+            end_token=sample.end_token,
         )
         for sample in samples
     ]

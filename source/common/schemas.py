@@ -79,6 +79,10 @@ class Request:
     context: str
     feedback_types: tuple[str, ...] = ("def",)
     n_syn: int = 5
+    # Gold whitespace-token span of the mention in ``context`` (inclusive,
+    # 0-based). Optional: without it the mention is located by string match.
+    start_token: int | None = None
+    end_token: int | None = None
 
     def __post_init__(self) -> None:
         # Light validation only; PipelineConfig enforces n_syn in {1, 3, 5, 10}.
@@ -90,6 +94,20 @@ class Request:
             raise ValueError("n_syn must be a positive integer")
         if self.n_syn < 1:
             raise ValueError("n_syn must be a positive integer")
+        for name, value in (
+            ("start_token", self.start_token),
+            ("end_token", self.end_token),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer or None")
+        if (
+            self.start_token is not None
+            and self.end_token is not None
+            and self.start_token > self.end_token
+        ):
+            raise ValueError("start_token must not exceed end_token")
 
 
 @dataclass(frozen=True)

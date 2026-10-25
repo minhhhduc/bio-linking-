@@ -101,7 +101,8 @@ Ràng buộc: **một concept có bao nhiêu alias thì có bấy nhiêu entry �
 ### 4.3. Đầu vào / đầu ra pipeline
 
 ```text
-Request  { mention: string, context: string, feedback_types: string[], n_syn: int }
+Request  { mention: string, context: string, feedback_types: string[], n_syn: int,
+           start_token?: int, end_token?: int }   // span token của mention trong context
 Response { cui: string, candidates: [{cui, score, surface}], debug: {Q_0, Q_F, ranks} }
 ```
 
@@ -113,19 +114,24 @@ xem [`translate-gold-pipeline.md`](translate-gold-pipeline.md).
 ### 4.4. Nguyên tắc chung: mention luôn nằm trong ngữ cảnh
 
 Mỗi mention $m$ luôn đi kèm câu chứa nó $s$ (`Request.context`); không có chế độ
-"mention rời". Dense query dùng chung cho **baseline và GRF**:
+"mention rời". Dense query dùng chung cho **baseline và GRF** giữ nguyên câu và
+đánh dấu mention **tại đúng vị trí của nó**:
 
 ```text
-text = m + " [SEP] " + s
-Q    = mean-pool( hidden states của các token thuộc m )   → L2-normalize
+text = s[:start] + " [SEP] " + m + " [SEP] " + s[end:]
+Q    = mean-pool( hidden states của các token nằm giữa hai [SEP] ) → L2-normalize
 ```
 
-- Context tham gia qua self-attention nên vector của mention phụ thuộc ngữ cảnh,
-  nhưng **không** được mean vào vector — tránh pha loãng tín hiệu mention.
-- `[CLS]` / `[SEP]` (offset 0) bị loại; chỉ token kết thúc trong $[0, |m|)$ được
-  đưa vào phép mean.
-- Mention đứng **đầu** chuỗi: span luôn là prefix `[0, |m|)`, và truncation câu
-  dài không bao giờ cắt mất mention.
+- `start` / `end` là span ký tự của mention trong câu, suy ra từ span token gold
+  (`start_token`, `end_token`, token hoá bằng khoảng trắng); nếu thiếu thì định
+  vị mention bằng so khớp chuỗi.
+- Phần câu **trước** và **sau** mention vẫn là context: tham gia self-attention
+  nên vector của mention phụ thuộc ngữ cảnh, nhưng **không** được mean vào
+  vector — tránh pha loãng tín hiệu mention.
+- `[CLS]` / `[SEP]` (offset 0) bị loại; chỉ token thực giao với span ký tự của
+  mention được đưa vào phép mean.
+- Truncation câu dài có thể cắt mất mention: encoder báo lỗi thay vì lặng lẽ
+  pool nhầm token.
 - Vector được L2-normalize trước khi so cosine với index.
 
 Phía index KB vẫn encode surface form độc lập ($E(a)$), vì tên khái niệm không

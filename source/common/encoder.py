@@ -10,7 +10,7 @@ from typing import Protocol, Sequence
 
 import numpy as np
 
-from .query import query_text
+from .query import mention_query
 
 
 class Encoder(Protocol):
@@ -85,14 +85,18 @@ class SentenceTransformerEncoder:
         self,
         mentions: Sequence[str],
         contexts: Sequence[str],
+        spans: Sequence[tuple[int, int] | None] | None = None,
     ) -> np.ndarray:
         """Embed a mention from its own token positions inside its context.
 
-        Each input is tokenized as ``mention [SEP] context`` and run through the
-        transformer; the returned vector is the mean of the last hidden states of
-        the *mention* tokens only, so the context shapes the mention through
-        attention without being averaged into its vector. The mention is the
-        prefix, so it survives tokenizer truncation of long contexts.
+        Each context is tokenized as written with ``[SEP]`` markers around the
+        mention (``common.query.mention_query``); the returned vector is the
+        mean of the last hidden states between the markers, i.e. of the mention
+        tokens only. Words before and after the mention stay context: they
+        shape it through attention without being averaged into its vector.
+
+        ``spans`` holds the gold ``(start_token, end_token)`` per row; ``None``
+        falls back to locating the mention string in the sentence.
 
         Rows are L2-normalised, like :meth:`encode`.
         """
@@ -102,6 +106,14 @@ class SentenceTransformerEncoder:
             raise ValueError(
                 f"got {len(mention_list)} mentions but {len(context_list)} contexts"
             )
+        if spans is None:
+            span_list: list[tuple[int, int] | None] = [None] * len(mention_list)
+        else:
+            span_list = list(spans)
+            if len(span_list) != len(mention_list):
+                raise ValueError(
+                    f"got {len(span_list)} spans for {len(mention_list)} mentions"
+                )
         if not mention_list:
             return np.zeros((0, self.dim), dtype=np.float32)
 
@@ -124,16 +136,23 @@ class SentenceTransformerEncoder:
             )
         device = self._model.device
 
-        texts = [
-            query_text(mention, context)
-            for mention, context in zip(mention_list, context_list)
-        ]
-        mention_ends = [len(mention) for mention in mention_list]
+        texts: list[str] = []
+        char_spans: list[tuple[int, int]] = []
+        for mention, context, span in zip(mention_list, context_list, span_list):
+            start_token, end_token = span if span is not None else (None, None)
+            text, mention_start, mention_end = mention_query(
+                mention,
+                context,
+                start_token=start_token,
+                end_token=end_token,
+            )
+            texts.append(text)
+            char_spans.append((mention_start, mention_end))
         out = np.zeros((len(texts), self.dim), dtype=np.float32)
 
         for start in range(0, len(texts), self._batch_size):
             texts_chunk = texts[start : start + self._batch_size]
-            ends_chunk = mention_ends[start : start + self._batch_size]
+            spans_chunk = char_spans[start : start + self._batch_size]
             encoded = tokenizer(
                 texts_chunk,
                 return_tensors="pt",
@@ -151,10 +170,15 @@ class SentenceTransformerEncoder:
                     f"reports {out.shape[1]}-d"
                 )
 
-            for row, mention_end in enumerate(ends_chunk):
-                # Mention tokens: real tokens (end > 0) that end inside the
-                # mention prefix. Special tokens have offset (0, 0).
-                keep = (offsets[row, :, 1] > 0) & (offsets[row, :, 1] <= mention_end)
+            for row, (mention_start, mention_end) in enumerate(spans_chunk):
+                # Mention tokens: real tokens (end > 0) overlapping the mention
+                # span between the two [SEP] markers. Special tokens have
+                # offset (0, 0) and are excluded by ``end > 0``.
+                keep = (
+                    (offsets[row, :, 1] > 0)
+                    & (offsets[row, :, 0] < mention_end)
+                    & (offsets[row, :, 1] > mention_start)
+                )
                 positions = keep.nonzero(as_tuple=False).squeeze(-1)
                 if positions.numel() == 0:
                     raise ValueError(
