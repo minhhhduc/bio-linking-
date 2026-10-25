@@ -64,7 +64,7 @@ Tài liệu này mô tả kiến trúc triển khai (implementation architecture
 | --- | --- | --- | --- |
 | C1 | KB Loader / Parser | Đọc KB do người dùng cung cấp, tạo bản ghi `(c, N_c, A_c)` | Định dạng JSONL do người dùng cung cấp |
 | C2 | Homonym Resolver | Khử trùng tên: `a + " (" + N_c + ")"` | Quy tắc chuỗi, hoặc embedding-based |
-| C3 | Encoder $E(\cdot)$ | Nhúng mention/feedback/surface form thành vector | BioSyn, SapBERT |
+| C3 | Encoder $E(\cdot)$ | Nhúng mention (pool token mention trong câu, §4.4), feedback và surface form thành vector | BioSyn, SapBERT |
 | C4 | Vector Index $\mathcal{I}$ | Lưu `(vector, CUI, surface form)`, tìm cosine top-k | FAISS / HNSW / exact |
 | C5 | Feedback Generator | Gọi LLM sinh $F_{\text{def}}, F_{\text{syn}}, F_{\text{std}}$ | GPT-4o, LLM nội bộ |
 | C6 | Fusion | Gộp $Q_0$ với $Q_{F_i}$ (pre) hoặc gộp ranked list (post) | Vector interp., Weighted RRF |
@@ -110,6 +110,29 @@ Bản gold tiếng Anh (cho thí nghiệm song ngữ) không do pipeline này si
 field `vi_*`, chỉ thêm `en_sentence_str`, `en_term` và span `en_*` tương ứng —
 xem [`translate-gold-pipeline.md`](translate-gold-pipeline.md).
 
+### 4.4. Nguyên tắc chung: mention luôn nằm trong ngữ cảnh
+
+Mỗi mention $m$ luôn đi kèm câu chứa nó $s$ (`Request.context`); không có chế độ
+"mention rời". Dense query dùng chung cho **baseline và GRF**:
+
+```text
+text = m + " [SEP] " + s
+Q    = mean-pool( hidden states của các token thuộc m )   → L2-normalize
+```
+
+- Context tham gia qua self-attention nên vector của mention phụ thuộc ngữ cảnh,
+  nhưng **không** được mean vào vector — tránh pha loãng tín hiệu mention.
+- `[CLS]` / `[SEP]` (offset 0) bị loại; chỉ token kết thúc trong $[0, |m|)$ được
+  đưa vào phép mean.
+- Mention đứng **đầu** chuỗi: span luôn là prefix `[0, |m|)`, và truncation câu
+  dài không bao giờ cắt mất mention.
+- Vector được L2-normalize trước khi so cosine với index.
+
+Phía index KB vẫn encode surface form độc lập ($E(a)$), vì tên khái niệm không
+có ngữ cảnh. Baseline và GRF dùng cùng một hàm
+(`SentenceTransformerEncoder.encode_mention_in_context`) cho $Q_0$, nên hai bên
+retrieve trên cùng một biểu diễn và số liệu so sánh được.
+
 ## 5. Luồng xử lý
 
 ### 5.1. Offline — build index
@@ -122,7 +145,7 @@ xem [`translate-gold-pipeline.md`](translate-gold-pipeline.md).
 ### 5.2. Online — Pipeline 1: Vector-based GRF (pre-retrieval)
 
 ```text
-m, s ──▶ E(m) = Q_0
+m, s ──▶ E_ctx(m, s) = Q_0           // §4.4: pool token của mention trong câu
      ──▶ LLM(m, s, t_i) = F_i        (song song cho từng t_i)
      ──▶ E(F_i) = Q_Fi
      ──▶ Q_GRF = α·Q_0 + Σ (1-α_i)·Q_Fi
@@ -141,7 +164,7 @@ Cấu hình trọng số:
 ### 5.3. Online — Pipeline 2: Rank-based GRF (post-retrieval)
 
 ```text
-m, s ──▶ E(m) = Q_0            ──▶ Search(Q_0, I)  = R_0
+m, s ──▶ E_ctx(m, s) = Q_0     ──▶ Search(Q_0, I)  = R_0
      ──▶ LLM(m, s, t_i) = F_i  ──▶ E(F_i) = Q_Fi   ──▶ Search(Q_Fi, I) = R_Fi
      ──▶ RRF(c) = Σ w_x · 1/r_x(c)        (w_x = 1/(n+1))
      ──▶ sort desc → top-k concept → re-ranker
