@@ -4,8 +4,9 @@ Implements architecture §5.2/§5.3 and reference_abstract §5:
 
 * Pipeline 1 (``fusion="vector"``): ``Q_GRF`` is the weighted interpolation of
   ``Q_0`` and the feedback vectors, followed by exactly one index scan.
-* ``Q_0`` embeds the mention together with its context (``common.query``), the
-  same query the dense baseline uses.
+* ``Q_0`` was formerly ``E(m)``; it now embeds the mention tokens inside the
+  sentence (``encoder.encode_mention_in_context``), the same query the dense
+  baseline uses.
 * Pipeline 2 (``fusion="rrf"``): one scan per query, concept-level rank lists,
   then weighted reciprocal rank fusion.
 * ``feedback_types=()`` degrades to plain dense retrieval (architecture §11).
@@ -22,8 +23,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 import numpy as np
-
-from common.query import query_text
 
 from .aggregation import aggregate_hits, concept_rank_list
 from .config import FEEDBACK_KINDS, N_SYN_VALUES, PipelineConfig
@@ -81,6 +80,10 @@ class EntityLinker:
             raise TypeError("index must provide search() and __len__()")
         if not (hasattr(encoder, "encode") and hasattr(encoder, "dim")):
             raise TypeError("encoder must provide encode() and dim")
+        if not hasattr(encoder, "encode_mention_in_context"):
+            raise TypeError(
+                "encoder must provide encode_mention_in_context(mentions, contexts)"
+            )
 
         self._index = index
         self._encoder = encoder
@@ -135,9 +138,7 @@ class EntityLinker:
                 "feedback_types is non-empty but no feedback_generator was supplied"
             )
 
-        q0 = self._encode_many(
-            [query_text(request.mention, request.context)]
-        )[0]
+        q0 = self._encode_mention_in_context(request.mention, request.context)
 
         feedbacks: tuple[Feedback, ...] = ()
         failures: tuple[FeedbackFailure, ...] = ()
@@ -390,6 +391,19 @@ class EntityLinker:
         if not np.all(np.isfinite(matrix)):
             raise ValueError("encoder returned non-finite values")
         return matrix
+
+    def _encode_mention_in_context(self, mention: str, context: str) -> np.ndarray:
+        """``Q_0``: the mention's tokens pooled inside its sentence."""
+        encode = self._encoder.encode_mention_in_context
+        matrix = np.asarray(encode([mention], [context]), dtype=np.float64)
+        if matrix.shape != (1, self._encoder.dim):
+            raise ValueError(
+                "encoder must return a (1, dim) matrix for one mention, got "
+                f"{matrix.shape!r}"
+            )
+        if not np.all(np.isfinite(matrix)):
+            raise ValueError("encoder returned non-finite values")
+        return matrix[0]
 
     @staticmethod
     def _validate_kinds(feedback_types) -> tuple[str, ...]:
