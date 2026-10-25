@@ -14,7 +14,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Dịch NER y khoa VI -> EN bằng model Qwen local."
     )
-    parser.add_argument("--model", required=True, help="đường dẫn model Qwen local")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Hugging Face repo id (vd Qwen/Qwen3-32B) hoặc path local",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument(
@@ -57,9 +61,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be >= 1")
 
-    model_path = Path(args.model)
-    if not model_path.exists():
-        parser.error(f"model path not found: {model_path}")
     input_path = Path(args.input_path)
     if not input_path.exists():
         parser.error(f"input file not found: {input_path}")
@@ -79,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--review must differ from --in")
 
     config = PipelineConfig(
-        model=str(model_path),
+        model=args.model,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
         max_seq_len=args.max_seq_len,

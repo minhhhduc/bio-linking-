@@ -375,7 +375,7 @@ def run_pipeline(
     *,
     backend=None,
 ) -> RunStats:
-    """Chạy pipeline; không gọi API ngoài, không tự tải model."""
+    """Chạy pipeline; model tải từ Hugging Face (hoặc path local) khi cần."""
 
     started = time.perf_counter()
     stats = RunStats()

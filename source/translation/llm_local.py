@@ -1,13 +1,13 @@
 """Backend transformers local và prompt dịch.
 
-Không import thư viện nặng ở module level để ``--help`` và các phần không dùng
-model vẫn chạy được. Không có API ngoài, không tự tải model, không lượng tử hoá.
+Model được tải từ Hugging Face hub (hoặc từ path local nếu có) bằng
+``transformers``. Không import thư viện nặng ở module level để ``--help`` và các
+phần không dùng model vẫn chạy được. Không có API ngoài, không lượng tử hoá.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 from .tagging import Entity
 
@@ -142,8 +142,8 @@ class HFBackend:
         max_seq_len: int | None = None,
         dtype: str = "bfloat16",
     ) -> None:
-        if not Path(model).exists():
-            raise BackendError(f"model path not found: {model}")
+        if not isinstance(model, str) or not model.strip():
+            raise BackendError("model must be a Hugging Face repo id or local path")
         if dtype not in self.DTYPES:
             raise BackendError(
                 f"unsupported dtype {dtype!r}; choose one of {self.DTYPES}"
@@ -154,6 +154,7 @@ class HFBackend:
             raise BackendError("max_seq_len must be >= 1 or None")
         try:
             import torch
+            import transformers
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as exc:
             raise BackendError("requires torch and transformers") from exc
@@ -162,13 +163,11 @@ class HFBackend:
         self.max_new_tokens = max_new_tokens
         self.max_seq_len = max_seq_len
         self.cuda = torch.cuda.is_available()
-        self.device = "cuda" if self.cuda else "cpu"
         if not self.cuda:
-            LOGGER.warning("torch is CPU-only; Qwen 27B needs a GPU in practice")
+            LOGGER.warning("torch has no CUDA; a 30B model will not fit on CPU")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
-            local_files_only=True,
             trust_remote_code=False,
         )
         if self.tokenizer.pad_token_id is None:
@@ -177,20 +176,16 @@ class HFBackend:
 
         torch_dtype = getattr(torch, dtype)
         kwargs = {
-            "local_files_only": True,
             "trust_remote_code": False,
+            # A100 80GB: để accelerate đặt thẳng lên GPU, tránh đỉnh RAM CPU.
+            "device_map": "auto" if self.cuda else None,
         }
-        try:
-            # transformers >= 4.56 dùng `dtype`; bản cũ dùng `torch_dtype`.
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model, dtype=torch_dtype, **kwargs
-            )
-        except TypeError:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model, torch_dtype=torch_dtype, **kwargs
-            )
-        self.model.to(self.device)
+        # transformers >= 4.56 dùng `dtype`; bản cũ dùng `torch_dtype`.
+        major, minor = (int(part) for part in transformers.__version__.split(".")[:2])
+        kwargs["dtype" if (major, minor) >= (4, 56) else "torch_dtype"] = torch_dtype
+        self.model = AutoModelForCausalLM.from_pretrained(model, **kwargs)
         self.model.eval()
+        self.device = self.model.device
 
     def generate_batch(self, prompts: list[str]) -> list[str]:
         texts = [_apply_chat_template(self.tokenizer, prompt) for prompt in prompts]
