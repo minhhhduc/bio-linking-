@@ -261,6 +261,8 @@ Lý do dùng `max`: một concept có nhiều alias; chỉ cần một alias kh�
 
 - **Candidate retrieval:** R@1, R@5 trên 8 bộ: NCBI Disease, BC5CDR (Disease/Chemical), NLM-Chem, GNormPlus, NLM-Gene, S800, Linnaeus.
 - **End-to-end normalization:** accuracy sau re-ranking (Bảng 3).
+- **Candidate accuracy:** $\text{acc@}k = \frac{1}{n}\sum_i \mathbb{1}[\text{gold}_i \in \text{top-}k\text{ candidates}_i]$
+  trên danh sách candidate cuối (sau re-ranking nếu có).
 - **Đối chứng:** mỗi cấu hình GRF phải chạy cùng seed/model với baseline không GRF để báo cáo "Mức tăng" có ý nghĩa.
 
 ## 11. Điểm mở rộng

@@ -19,7 +19,7 @@ from .data import (
     load_bel_jsonl,
 )
 from .encoder import Encoder, SentenceTransformerEncoder
-from .evaluator import Metrics, metrics_from_responses
+from .evaluator import Metrics, accuracy_at_k, metrics_from_responses
 from .index import SINGLE_FILE_FORMAT, VectorIndex
 from .kb import (
     concepts_from_dataset,
@@ -55,6 +55,7 @@ __all__ = [
     "SINGLE_FILE_FORMAT",
     "SentenceTransformerEncoder",
     "VectorIndex",
+    "accuracy_at_k",
     "aggregate_hits",
     "concept_rank_list",
     "concepts_from_dataset",

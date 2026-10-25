@@ -1,4 +1,4 @@
-"""C9 metrics: R@1/R@5 on retrieval plus end-to-end accuracy.
+"""C9 metrics: R@1/R@5 on retrieval, acc@k on the candidate list, accuracy.
 
 These functions operate on already-computed :class:`Response` objects, so the
 same code serves the GRF pipeline and the dense baseline.
@@ -86,6 +86,43 @@ def _metrics(samples: Sequence[MentionSample], responses: Sequence[Response]) ->
         recall_at_5=recall_5 / n,
         accuracy=correct / n,
     )
+
+
+def accuracy_at_k(
+    samples: Iterable[MentionSample],
+    responses: Iterable[Response],
+    k: int,
+) -> tuple[float, dict[str | None, float]]:
+    """acc@k: share of samples whose gold CUI is among the first ``k`` candidates.
+
+    Uses the saved candidate list, not the untruncated concept ranking: after
+    re-ranking this is the list the re-ranker actually produced.
+    """
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ValueError("k must be a positive integer")
+    sample_list = list(samples)
+    if isinstance(responses, (str, bytes)):
+        raise ValueError("responses must be a sequence of Response objects")
+    response_list = list(responses)
+    if len(sample_list) != len(response_list):
+        raise ValueError(
+            f"got {len(sample_list)} samples but {len(response_list)} responses"
+        )
+
+    hits: dict[str | None, int] = {}
+    counts: dict[str | None, int] = {}
+    for index, (sample, response) in enumerate(zip(sample_list, response_list)):
+        if not isinstance(response, Response):
+            raise ValueError(f"responses[{index}] must be a Response")
+        cuis = {candidate.cui for candidate in response.candidates[:k]}
+        hits[sample.label] = hits.get(sample.label, 0) + (
+            sample.gold_cui in cuis
+        )
+        counts[sample.label] = counts.get(sample.label, 0) + 1
+
+    by_label = {label: hits[label] / counts[label] for label in counts}
+    overall = sum(hits.values()) / len(sample_list) if sample_list else 0.0
+    return overall, by_label
 
 
 def metrics_from_responses(
