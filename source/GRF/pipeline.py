@@ -7,7 +7,8 @@ Implements architecture §5.2/§5.3 and reference_abstract §5:
 * ``Q_0`` was formerly ``E(m)``; it now pools the mention's token states in
   its sentence and adds ``E(m)``, with the mention kept in place
   (``common.query.mention_query`` + ``encoder.encode_mention_in_context``), the
-  same query the dense baseline uses.
+  same query the dense baseline uses.  ``use_context_query=False`` drops the
+  context and uses ``E(m)`` alone, like the dense baseline's switch.
 * Pipeline 2 (``fusion="rrf"``): one scan per query, concept-level rank lists,
   then weighted reciprocal rank fusion.
 * ``feedback_types=()`` degrades to plain dense retrieval (architecture §11).
@@ -74,9 +75,12 @@ class EntityLinker:
         feedback_generator=None,
         reranker=None,
         concept_names: Mapping[str, str] | None = None,
+        use_context_query: bool = True,
     ) -> None:
         if not isinstance(config, PipelineConfig):
             raise TypeError("config must be a PipelineConfig")
+        if not isinstance(use_context_query, bool):
+            raise TypeError("use_context_query must be a bool")
         if not (hasattr(index, "search") and hasattr(index, "__len__")):
             raise TypeError("index must provide search() and __len__()")
         if not (hasattr(encoder, "encode") and hasattr(encoder, "dim")):
@@ -91,6 +95,7 @@ class EntityLinker:
         self._encoder = encoder
         self.config = config
         self._feedback_generator = feedback_generator
+        self._use_context_query = use_context_query
 
         if config.index_kb is not None:
             source_kbs = getattr(index, "source_kbs", None)
@@ -142,12 +147,7 @@ class EntityLinker:
             )
 
         if q0 is None:
-            q0 = self._encode_mention_in_context(
-                request.mention,
-                request.context,
-                request.start_token,
-                request.end_token,
-            )
+            q0 = self._encode_q0([request])[0]
         else:
             q0 = np.asarray(q0, dtype=np.float64)
             if q0.shape != (self._encoder.dim,):
@@ -277,7 +277,7 @@ class EntityLinker:
             raise ValueError("progress_callback must be callable or None")
         items = list(requests)
         # One batched forward pass for every Q_0 instead of one per request.
-        q0_matrix = self._encode_many_in_context(items)
+        q0_matrix = self._encode_q0(items)
         responses: list[Response] = []
         for done, (request, q0) in enumerate(zip(items, q0_matrix), start=1):
             responses.append(self.link(request, q0=q0))
@@ -409,41 +409,23 @@ class EntityLinker:
             raise ValueError("encoder returned non-finite values")
         return matrix
 
-    def _encode_mention_in_context(
-        self,
-        mention: str,
-        context: str,
-        start_token: int | None,
-        end_token: int | None,
-    ) -> np.ndarray:
-        """``Q_0``: the mention's tokens pooled in place inside its sentence."""
-        encode = self._encoder.encode_mention_in_context
-        matrix = np.asarray(
-            encode([mention], [context], [(start_token, end_token)]),
-            dtype=np.float64,
-        )
-        if matrix.shape != (1, self._encoder.dim):
-            raise ValueError(
-                "encoder must return a (1, dim) matrix for one mention, got "
-                f"{matrix.shape!r}"
-            )
-        if not np.all(np.isfinite(matrix)):
-            raise ValueError("encoder returned non-finite values")
-        return matrix[0]
+    def _encode_q0(self, items: Sequence[Request]) -> np.ndarray:
+        """Batched ``Q_0``: the mention in context, or the mention alone.
 
-    def _encode_many_in_context(self, items: Sequence[Request]) -> np.ndarray:
-        """Batched ``Q_0`` for every request, in one encoder call."""
+        ``use_context_query=False`` encodes ``mention`` on its own through the
+        same ``encoder.encode`` that built the index rows.
+        """
         if not items:
             return np.zeros((0, self._encoder.dim), dtype=np.float64)
-        encode = self._encoder.encode_mention_in_context
-        matrix = np.asarray(
-            encode(
+        if self._use_context_query:
+            raw = self._encoder.encode_mention_in_context(
                 [item.mention for item in items],
                 [item.context for item in items],
                 [(item.start_token, item.end_token) for item in items],
-            ),
-            dtype=np.float64,
-        )
+            )
+        else:
+            raw = self._encoder.encode([item.mention for item in items])
+        matrix = np.asarray(raw, dtype=np.float64)
         if matrix.shape != (len(items), self._encoder.dim):
             raise ValueError(
                 f"encoder must return an ({len(items)}, dim) matrix, got "
