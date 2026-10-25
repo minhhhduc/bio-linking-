@@ -4,6 +4,8 @@ Implements architecture §5.2/§5.3 and reference_abstract §5:
 
 * Pipeline 1 (``fusion="vector"``): ``Q_GRF`` is the weighted interpolation of
   ``Q_0`` and the feedback vectors, followed by exactly one index scan.
+* ``Q_0`` embeds the mention together with its context (``common.query``), the
+  same query the dense baseline uses.
 * Pipeline 2 (``fusion="rrf"``): one scan per query, concept-level rank lists,
   then weighted reciprocal rank fusion.
 * ``feedback_types=()`` degrades to plain dense retrieval (architecture §11).
@@ -20,6 +22,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 import numpy as np
+
+from common.query import query_text
 
 from .aggregation import aggregate_hits, concept_rank_list
 from .config import FEEDBACK_KINDS, N_SYN_VALUES, PipelineConfig
@@ -131,7 +135,9 @@ class EntityLinker:
                 "feedback_types is non-empty but no feedback_generator was supplied"
             )
 
-        q0 = self._encode_many([request.mention])[0]
+        q0 = self._encode_many(
+            [query_text(request.mention, request.context)]
+        )[0]
 
         feedbacks: tuple[Feedback, ...] = ()
         failures: tuple[FeedbackFailure, ...] = ()
