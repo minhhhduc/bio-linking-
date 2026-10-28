@@ -160,7 +160,7 @@ viện — đúng hàm đã dựng index row.
 m, s ──▶ E_ctx(m, s) = Q_0           // §4.4: pool token của mention trong câu
      ──▶ LLM(m, s, t_i) = F_i        (song song cho từng t_i)
      ──▶ E(F_i) = Q_Fi
-     ──▶ Q_GRF = α·Q_0 + Σ (1-α_i)·Q_Fi
+     ──▶ Q_GRF = w_0·Q_0 + Σ w_i·Q_Fi      (w_0 = w_i = 1/(n+1), §7.2)
      ──▶ cosine(Q_GRF, I) → top-k surface forms
      ──▶ score(c) = max_{a ∈ A_c ∩ top-k} S(a)
      ──▶ top-k concept → re-ranker / pick top-1
@@ -170,8 +170,10 @@ m, s ──▶ E_ctx(m, s) = Q_0           // §4.4: pool token của mention tr
 
 Cấu hình trọng số:
 
-- Đơn lẻ ($n = 1$): $\alpha = \frac{1}{n+1} = 0.5$.
+- Đơn lẻ ($n = 1$): $w_0 = w_1 = \frac{1}{n+1} = 0.5$.
 - All-in-One ($n$ loại): mỗi thành phần trọng số $\frac{1}{n+1}$.
+
+Toàn bộ batch được xử lý theo các pha ma trận độc lập ở §7, không có vòng lặp Python cho từng mention.
 
 ### 5.3. Online — Pipeline 2: Rank-based GRF (post-retrieval)
 
@@ -234,33 +236,90 @@ Ghi chú triển khai:
 - Với $F_{\text{syn}}$: $\vec{Q}_F = \frac{1}{n}\sum_{j=1}^{n} E(F_{\text{syn},j})$ — cần parse danh sách trước khi encode.
 - Timeout/fallback: nếu LLM lỗi, pipeline thoái hóa về $Q_0$ (tức baseline).
 
-## 7. Tầng fusion
+## 7. Retrieval — các pha độc lập và vector hóa
 
-### 7.1. Vector interpolation (pre-retrieval)
+Retrieval gồm các pha ma trận độc lập; không có vòng lặp Python cho từng mention hay surface form.
 
-```text
-Q_GRF = α·Q_0 + (1-α)·Q_F                  # đơn lẻ, α = 1/(n+1)
-Q_GRF = 1/(n+1)·Q_0 + Σ 1/(n+1)·Q_Fi       # all-in-one
-```
+### 7.1. Pha 1: Encode queries (batch)
 
-Bất biến: tổng trọng số $= 1$; khi $n=1$ hai công thức trùng nhau.
+$$
+\begin{aligned}
+Q_0 &\in \mathbb{R}^{b \times d} && \text{(} b \text{ mention, một lượt forward)} \\
+F &\in \mathbb{R}^{b \times n \times \ell} && \text{(feedback texts, song song per request)} \\
+Q_F &\in \mathbb{R}^{b \times n \times d} && \text{(encode toàn bộ feedback, một lượt)}
+\end{aligned}
+$$
 
-### 7.2. Weighted RRF (post-retrieval)
+- $b$: batch size (số mention)
+- $n$: số feedback component thành công per request
+- $d$: encoder dimension
+- $\ell$: độ dài text (biến thiên)
 
-```text
-RRF(c) = α/r_0(c) + (1-α)/r_F(c)                      # đơn lẻ
-RRF(c) = 1/(n+1)·1/r_0(c) + Σ 1/(n+1)·1/r_Fi(c)       # all-in-one
-```
+### 7.2. Pha 2a: Vector interpolation (pre-retrieval)
 
-Quy ước: nếu $c \notin R_x$ thì $1/r_x(c) = 0$.
+$$
+\begin{aligned}
+w_0 &= \frac{1}{n+1}, \quad w_i = \frac{1}{n+1} \quad \forall i \in [1, n] \\
+Q_{\text{GRF}}[j] &= w_0 \cdot Q_0[j] + \sum_{i=1}^{n_j} w_i \cdot Q_F[j, i] && \text{per mention } j \\
+Q_{\text{GRF}} &= \text{L2-normalize}(Q_{\text{GRF}}) \in \mathbb{R}^{b \times d}
+\end{aligned}
+$$
 
-### 7.3. Concept aggregation
+### 7.3. Pha 2b: RRF retrieval (post-retrieval)
 
-```text
-Score(c) = max_{a ∈ A_c ∩ Top-k} S(a)
-```
+$$
+\begin{aligned}
+Q_{\text{all}}[j] &= [Q_0[j]; Q_F[j, 1]; \ldots; Q_F[j, n_j]] && \in \mathbb{R}^{(n_j+1) \times d} \\
+\text{RRF}(c; j) &= \sum_{x=0}^{n_j} w_x \cdot \frac{1}{r_x(c)} && \text{where } \frac{1}{r_x(c)} = 0 \text{ if } c \notin R_x
+\end{aligned}
+$$
 
-Lý do dùng `max`: một concept có nhiều alias; chỉ cần một alias khớp tốt là đủ đại diện.
+Với mọi $j$, scan index $(n_j + 1)$ lần song song (batch); mỗi query trả về rank list $R_x$.
+
+### 7.4. Pha 3: Matmul + top-k (vectorized)
+
+$$
+\begin{aligned}
+A &\in \mathbb{R}^{N \times d} && \text{(index matrix, } N \text{ surface forms)} \\
+Q &\in \mathbb{R}^{m \times d} && \text{(queries: } Q_{\text{GRF}} \text{ hoặc } Q_{\text{all}} \text{ flat)} \\
+S &= Q \cdot A^\top \in \mathbb{R}^{m \times N} && \text{(cosine scores, cả 2 bên unit-norm)} \\
+\text{top-}k(S[i, :]) &\to \{(a, s_{ia})\}_{a \in \text{Top-}k} && \text{per query row } i
+\end{aligned}
+$$
+
+Quy tắc thứ tự: $(-s, \text{cui}, \text{surface})$ lexicographic; deterministic ngay cả khi điểm bằng nhau.
+
+GPU path: chunk query thành $c$ hàng, $S_{\text{chunk}} = Q_{\text{chunk}} \cdot A^\top$ trên device, `torch.topk(S_chunk, k, dim=0)` per column, copy về CPU chỉ top-$k$ row per query.
+
+### 7.5. Pha 4: Concept aggregation (vectorized)
+
+$$
+\begin{aligned}
+\text{Score}(c) &= \max_{a \in \mathcal{A}_c \cap \text{Top-}k} S(a) \\
+\text{Surface}_{\text{rep}}(c) &= \arg\max_{a \in \mathcal{A}_c \cap \text{Top-}k} \big( S(a), -\text{lex}(a) \big)
+\end{aligned}
+$$
+
+Triển khai: một lượt `np.lexsort` trên khoá $(-\text{score}, \text{cui}, \text{surface})$ cho toàn bộ block $(m \times k)$, rồi cắt `limit` phần tử đầu của từng hàng bằng `np.bincount` + `cumsum` (không có vòng lặp Python per mention). Tie-break surface: lex ascending.
+
+### 7.6. Pha 5: RRF fusion (nếu dùng pipeline 2)
+
+$$
+\begin{aligned}
+r_x(c) &= \text{rank của } c \text{ trong } R_x \quad \text{(1-based, hoặc } \infty \text{)} \\
+\text{RRF}(c) &= \sum_{x=0}^{n} w_x \cdot \frac{1}{r_x(c)} && w_x = \frac{1}{n+1}
+\end{aligned}
+$$
+
+Rank list $R_x$ được tính từ hits của query $x$ bằng aggregation pha 5, rồi assign rank 1-based. Fusion là **một** scatter-add: dựng mảng phẳng `owner * n_concepts + cui_id` và cộng $w_x / r_x(c)$ bằng `np.bincount`, thu được ma trận điểm $(b \times |\mathcal{C}|)$ trong một lượt thay vì một dict cho mỗi query.
+
+### 7.7. Sắp xếp cuối và top-k concept
+
+$$
+\text{Candidates} = \text{argsort}_{c} \big( -\text{Score}(c), c \big)[:k_{\text{concept}}]
+$$
+
+Trả về danh sách `(cui, score, surface_rep)` đã sắp xếp; đây là đầu vào của re-ranker (stage riêng biệt, không thuộc retrieval).
 
 ## 8. Tầng re-ranking
 

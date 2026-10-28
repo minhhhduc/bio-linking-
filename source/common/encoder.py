@@ -49,6 +49,11 @@ class SentenceTransformerEncoder:
 
         kwargs = {} if device is None else {"device": device}
         self._model = SentenceTransformer(model_name, **kwargs)
+        # SentenceTransformer only calls ``self.eval()`` inside ``encode()``.
+        # ``encode_mention_in_context`` drives ``auto_model`` directly and is
+        # the first model call in the pipeline, so without this the mention
+        # tokens are pooled with dropout active.
+        self._model.eval()
         self._batch_size = batch_size
         self._model_name = model_name
         self._dim: int | None = None
@@ -163,7 +168,11 @@ class SentenceTransformerEncoder:
                 texts_chunk,
                 return_tensors="pt",
                 padding=True,
+                # Same cut-off ``encode()`` uses; without ``max_length`` the
+                # tokenizer falls back to the checkpoint's declared limit and
+                # the two paths could tokenise the same context differently.
                 truncation=True,
+                max_length=self._model.max_seq_length,
                 return_offsets_mapping=True,
             )
             offsets = encoded.pop("offset_mapping")
@@ -189,6 +198,13 @@ class SentenceTransformerEncoder:
                 if positions.numel() == 0:
                     raise ValueError(
                         f"no tokens found inside mention {mention_list[start + row]!r}"
+                    )
+                # A mention past ``max_seq_length`` would otherwise be pooled
+                # from a prefix of itself without any warning.
+                if int(offsets[row, positions[-1], 1]) < mention_end:
+                    raise ValueError(
+                        f"mention {mention_list[start + row]!r} is truncated by "
+                        f"max_seq_length={self._model.max_seq_length}"
                     )
                 vector = hidden[row, positions.to(hidden.device)].mean(dim=0)
                 out[start + row] = vector.float().cpu().numpy()

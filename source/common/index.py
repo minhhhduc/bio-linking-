@@ -30,6 +30,8 @@ class VectorIndex:
     # around 256 MiB of float32 whatever the index size (T4-friendly).
     _GPU_QUERY_CHUNK = 256
     _GPU_SCORE_BUDGET = 1 << 26
+    # Same idea for the CPU path: floats of the (rows, N) score block.
+    _CPU_SCORE_BUDGET = 1 << 25
 
     def __init__(
         self,
@@ -261,41 +263,130 @@ class VectorIndex:
 
     def _search_cpu(
         self,
-        vector: np.ndarray,
+        matrix: np.ndarray,
         top_k: int,
         source_kb: str | None,
-    ) -> list[RetrievalHit]:
-        if source_kb is None:
-            indices = range(len(self))
-        else:
-            indices = [
-                i for i, kb_name in enumerate(self.source_kbs)
-                if kb_name == source_kb
-            ]
-        if not indices:
-            return []
+    ) -> list[list[RetrievalHit]]:
+        """Exact cosine scan on CPU: one matmul per query chunk, no row loop.
 
-        unit_query = vector / float(np.linalg.norm(vector))
-        # Exact cosine scan: docs/architecture.md C4 explicitly allows "exact"
-        # as an index implementation; FAISS/HNSW can replace this class.
-        scores = self.vectors @ unit_query
-        ordered = sorted(
-            indices,
-            key=lambda i: (
-                -float(scores[i]),
-                self.cuis[i],
-                self.surfaces[i],
-            ),
-        )
-        return [
-            RetrievalHit(
-                cui=self.cuis[i],
-                surface=self.surfaces[i],
-                score=float(scores[i]),
-                rank=rank,
+        The score block is ``S = Q · Aᵀ`` (both sides unit-norm).  The k-th
+        score of every row is found with a partition **on a copy**, so the
+        score block keeps its original column order and a column index still
+        addresses the same index row.  Every entry at or above that k-th score
+        is kept, so ties at the k-th score are resolved by the documented rule
+        ``(-score, cui, surface)`` instead of by whichever entry the partition
+        happened to leave inside the slice.
+        """
+        count = len(self)
+        empty: list[list[RetrievalHit]] = [[] for _ in range(matrix.shape[0])]
+        if count == 0:
+            return empty
+        # Rows are validated non-zero in search_batch; unit-norm makes the dot
+        # product a cosine (the index rows are already unit-norm).
+        matrix = matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
+
+        # Rows of the index that are eligible for this search.  When a
+        # source_kb filter is given, the eligible rows form a compact matrix,
+        # so the k-th largest is looked up in the *candidate* block, not in a
+        # full-width block padded with -inf.
+        if source_kb is None:
+            positions = np.arange(count, dtype=np.int64)
+        else:
+            positions = np.fromiter(
+                (
+                    index
+                    for index, name in enumerate(self.source_kbs)
+                    if name == source_kb
+                ),
+                dtype=np.int64,
             )
-            for rank, i in enumerate(ordered[:top_k], start=1)
-        ]
+        candidates = int(positions.size)
+        if candidates == 0:
+            return empty
+        columns = min(top_k, candidates)
+        chunk_rows = max(
+            1, min(self._GPU_QUERY_CHUNK, self._CPU_SCORE_BUDGET // count)
+        )
+        results: list[list[RetrievalHit]] = []
+        for start in range(0, matrix.shape[0], chunk_rows):
+            chunk = matrix[start : start + chunk_rows]
+            # One matrix multiply over the whole index, as the contract says.
+            scores = chunk @ self.vectors.T
+            # The source_kb filter only selects columns of that same score
+            # block, so a filtered and an unfiltered search score the same
+            # row identically.
+            block = scores if source_kb is None else scores[:, positions]
+            # np.partition returns a copy; the k-th largest of each row lands
+            # at index candidates - columns of that copy.
+            cutoff = np.partition(block, candidates - columns, axis=1)[
+                :, candidates - columns
+            ]
+            rows, cols = np.nonzero(block >= cutoff[:, None])
+            if rows.size == 0:
+                results.extend([[] for _ in range(chunk.shape[0])])
+                continue
+            values = block[rows, cols]
+            results.extend(
+                self._assemble(
+                    rows,
+                    positions[cols],
+                    values,
+                    columns,
+                    chunk.shape[0],
+                )
+            )
+        return results
+
+    def _assemble(
+        self,
+        columns_of_row: np.ndarray,
+        indices: np.ndarray,
+        values: np.ndarray,
+        limit: int,
+        n_queries: int,
+    ) -> list[list[RetrievalHit]]:
+        """Order the candidate block and cut it to ``limit`` per query row.
+
+        ``columns_of_row`` is the query row of every candidate, ``indices`` the
+        index row it came from and ``values`` its score.  One ``np.lexsort``
+        orders every query row at once by ``(-score, cui, surface)`` — the
+        query row is the primary key, the tie-break keys come last because
+        ``np.lexsort`` gives priority to the *last* key.
+        """
+        flat = indices.astype(np.int64, copy=False)
+        cuis = np.asarray([self.cuis[i] for i in flat], dtype=np.str_)
+        surfaces = np.asarray([self.surfaces[i] for i in flat], dtype=np.str_)
+        order = np.lexsort(
+            (surfaces, cuis, -np.asarray(values, dtype=np.float64), columns_of_row)
+        )
+        rows = columns_of_row[order]
+        cols = flat[order]
+        values = np.asarray(values, dtype=np.float64)[order]
+
+        # Keep the first ``limit`` candidates of every query row.
+        widths = np.bincount(rows, minlength=n_queries)
+        offsets = np.concatenate(([0], np.cumsum(widths)))
+        position = np.arange(rows.size) - offsets[rows]
+        kept = np.flatnonzero(position < limit)
+        kept_rows = rows[kept]
+        kept_widths = np.bincount(kept_rows, minlength=n_queries)
+        kept_offsets = np.concatenate(([0], np.cumsum(kept_widths)))
+
+        hits: list[list[RetrievalHit]] = []
+        for row in range(n_queries):
+            base = kept[kept_offsets[row] : kept_offsets[row + 1]]
+            hits.append(
+                [
+                    RetrievalHit(
+                        cui=self.cuis[int(cols[i])],
+                        surface=self.surfaces[int(cols[i])],
+                        score=float(values[i]),
+                        rank=rank,
+                    )
+                    for rank, i in enumerate(base.tolist(), start=1)
+                ]
+            )
+        return hits
 
     def search_batch(
         self,
@@ -308,11 +399,11 @@ class VectorIndex:
 
         Scores are one matrix product, ``R = queries @ self.vectors.T`` (both
         sides are unit-norm, so the product is cosine), then top-k along each
-        row. The ordering rule is identical to calling :meth:`search` per row.
-        With :meth:`use_gpu` active, the product and ``topk`` run on the device
-        in query chunks and only rows at or above each k-th score are copied
-        back to CPU; float32 scores can differ in the last ULPs from the CPU
-        path.
+        row; the batch is chunked so the ``(rows, N)`` block stays bounded.
+        The ordering rule is identical to calling :meth:`search` per row.  With
+        :meth:`use_gpu` active, the product and ``topk`` run on the device in
+        query chunks and only rows at or above each k-th score are copied back
+        to CPU; float32 scores can differ in the last ULPs from the CPU path.
         """
         self._validate_top_k(top_k)
         self._validate_source_kb(source_kb)
@@ -333,7 +424,7 @@ class VectorIndex:
             raise ValueError("every query must have a non-zero norm")
         if self._device is not None:
             return self._search_gpu(matrix, top_k, source_kb)
-        return [self._search_cpu(row, top_k, source_kb) for row in matrix]
+        return self._search_cpu(matrix, top_k, source_kb)
 
     def _search_gpu(
         self,
@@ -386,37 +477,60 @@ class VectorIndex:
                 if rows is not None:
                     scores = scores.index_select(0, rows)
 
-                # top-k per query column on the device, then the CPU tie-break
-                # (score desc, cui, surface) on k hits only. Scores can differ
-                # in the last float32 ULPs from BLAS, but the ordering rule is
-                # the same as the CPU path.
+                # top-k per query column on the device, then one vectorised
+                # tie-break (score desc, cui, surface) on the k hits of every
+                # column. Scores can differ in the last float32 ULPs from BLAS,
+                # but the ordering rule is the same as the CPU path.
                 values, indices = torch.topk(scores, k=columns, dim=0)
                 values = values.cpu().numpy()
                 indices = indices.cpu().numpy()
-
-                for column in range(scores.shape[1]):
-                    column_indices = indices[:, column]
-                    column_values = values[:, column]
-                    if positions_cpu is not None:
-                        column_indices = positions_cpu[column_indices]
-                    order = sorted(
-                        range(len(column_indices)),
-                        key=lambda j: (
-                            -float(column_values[j]),
-                            self.cuis[int(column_indices[j])],
-                            self.surfaces[int(column_indices[j])],
-                        ),
-                    )
-                    results.append([
-                        RetrievalHit(
-                            cui=self.cuis[int(column_indices[j])],
-                            surface=self.surfaces[int(column_indices[j])],
-                            score=float(column_values[j]),
-                            rank=rank,
-                        )
-                        for rank, j in enumerate(order[:top_k], start=1)
-                    ])
+                if positions_cpu is not None:
+                    indices = positions_cpu[indices]
+                ordered_indices, ordered_values = self._order_topk(indices, values)
+                results.extend(self._hits(ordered_indices, ordered_values))
         return results
+
+    def _order_topk(
+        self, indices: np.ndarray, values: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sort a ``(k, rows)`` hit block by ``(-score, cui, surface)``.
+
+        ``np.lexsort(..., axis=0)`` sorts every column independently, so the
+        whole chunk is ordered in one call instead of one Python ``sorted`` per
+        mention. ``cui`` / ``surface`` are compared as strings, matching the
+        rule documented on :meth:`search`.
+        """
+        flat = indices.ravel().astype(np.int64, copy=False)
+        cuis = np.asarray(
+            [self.cuis[i] for i in flat], dtype=np.str_
+        ).reshape(indices.shape)
+        surfaces = np.asarray(
+            [self.surfaces[i] for i in flat], dtype=np.str_
+        ).reshape(indices.shape)
+        order = np.lexsort(
+            (surfaces, cuis, -np.asarray(values, dtype=np.float64)), axis=0
+        )
+        return (
+            np.take_along_axis(indices, order, axis=0),
+            np.take_along_axis(values, order, axis=0),
+        )
+
+    def _hits(
+        self, indices: np.ndarray, values: np.ndarray
+    ) -> list[list[RetrievalHit]]:
+        """``(k, rows)`` sorted hit arrays -> one hit list per query row."""
+        return [
+            [
+                RetrievalHit(
+                    cui=self.cuis[int(indices[rank, column])],
+                    surface=self.surfaces[int(indices[rank, column])],
+                    score=float(values[rank, column]),
+                    rank=rank + 1,
+                )
+                for rank in range(indices.shape[0])
+            ]
+            for column in range(indices.shape[1])
+        ]
 
     def search(
         self,
