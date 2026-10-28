@@ -23,6 +23,7 @@ the weighting explicit (one component per feedback type, all weights
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -86,11 +87,18 @@ class EntityLinker:
         reranker=None,
         concept_names: Mapping[str, str] | None = None,
         use_context_query: bool = True,
+        feedback_workers: int = 8,
     ) -> None:
         if not isinstance(config, PipelineConfig):
             raise TypeError("config must be a PipelineConfig")
         if not isinstance(use_context_query, bool):
             raise TypeError("use_context_query must be a bool")
+        if (
+            isinstance(feedback_workers, bool)
+            or not isinstance(feedback_workers, int)
+            or feedback_workers < 1
+        ):
+            raise ValueError("feedback_workers must be a positive integer")
         if not (hasattr(index, "search") and hasattr(index, "__len__")):
             raise TypeError("index must provide search() and __len__()")
         if not (hasattr(encoder, "encode") and hasattr(encoder, "dim")):
@@ -106,6 +114,7 @@ class EntityLinker:
         self.config = config
         self._feedback_generator = feedback_generator
         self._use_context_query = use_context_query
+        self._feedback_workers = feedback_workers
 
         if config.index_kb is not None:
             source_kbs = getattr(index, "source_kbs", None)
@@ -198,15 +207,21 @@ class EntityLinker:
         Every phase is a batched array operation over the whole request list:
 
         1. ``Q_0``: one encoder call for all mentions (§4.4).
-        2. feedback: one LLM round per mention (the only per-mention phase).
+        2. feedback: one LLM round per mention, mentions run concurrently.
         3. feedback embeddings: one encoder call for every feedback text.
         4. fusion: ``Q_GRF = W · [Q_0; Q_F]``, a single contraction.
         5. retrieval: one index scan (vector fusion) or ``n_i + 1`` (RRF).
         6. aggregation: concept scores from the retrieved surface forms.
 
-        ``progress_callback(done, total)``, when supplied, is called after each
-        request of the slow phase: feedback generation when any request asks
-        for feedback, otherwise after each linked request.
+        Phase 2 is the only per-mention phase, so it is the only one that
+        parallelises: each mention's round trips occupy a worker and the
+        encoder/index phases stay single batched calls (concurrent encoder
+        calls would only contend for the same device).
+        ``feedback_workers`` bounds that pool.
+
+        ``progress_callback(done, total)``, when supplied, is called as each
+        mention finishes feedback generation, or after each linked request
+        when no feedback was requested.
         """
         if progress_callback is not None and not callable(progress_callback):
             raise ValueError("progress_callback must be callable or None")
@@ -220,14 +235,29 @@ class EntityLinker:
         # Phase 1 — Q_0 for the whole batch in one encoder call.
         q0_matrix = self._encode_q0(items)
 
-        # Phase 2 — feedback text per mention (LLM round trips).
-        outcomes = []
-        for done, (request, kinds) in enumerate(
-            zip(items, kinds_per_request), start=1
-        ):
-            outcomes.append(self._generate_feedback(request, kinds))
-            if progress_callback is not None and reports_feedback:
-                progress_callback(done, total)
+        # Phase 2 — feedback text per mention.  The only per-mention phase, and
+        # the expensive one: every mention's LLM round trips run concurrently
+        # instead of one mention after another.  Results are collected in
+        # request order, so the batch stays deterministic.
+        outcomes: list = [None] * total
+        if not reports_feedback:
+            # Nothing to generate; skip the pool entirely.
+            outcomes = [((), ()) for _ in items]
+        else:
+            with ThreadPoolExecutor(max_workers=self._feedback_workers) as pool:
+                futures = {
+                    pool.submit(self._generate_feedback, request, kinds): index
+                    for index, (request, kinds) in enumerate(
+                        zip(items, kinds_per_request)
+                    )
+                }
+                done = 0
+                for future in as_completed(futures):
+                    index = futures[future]
+                    outcomes[index] = future.result()
+                    done += 1
+                    if progress_callback is not None:
+                        progress_callback(done, total)
         feedbacks = [outcome[0] for outcome in outcomes]
         failures = [outcome[1] for outcome in outcomes]
 
