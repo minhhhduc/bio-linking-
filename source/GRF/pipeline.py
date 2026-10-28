@@ -45,6 +45,10 @@ from .schemas import (
     RetrievalHit,
 )
 
+# Mentions per dense RRF block.  The fusion is a (rows, |concepts|) float64
+# matrix; 256 rows keeps that transient near 100 MB for a 50k-concept KB.
+_RRF_ROW_BLOCK = 256
+
 
 def _as_vector_list(vector: np.ndarray) -> list[float]:
     """JSON-friendly Python floats (debug output)."""
@@ -537,15 +541,22 @@ class EntityLinker:
         matrix = np.stack(queries)
         hit_lists = self._search_rows(matrix)
 
-        # Concept rank list per query -> dense (q, k) id/rank arrays.
-        concept_ids: dict[str, int] = {}
-        id_rows: list[list[int]] = []
-        rank_rows: list[list[int]] = []
+        # Concept rank list per query -> dense (queries, |concepts|) id/rank
+        # arrays, **one row block at a time**.  The dense score matrix is
+        # (rows, |concepts|); building it for the whole gold set at once holds
+        # every mention's row simultaneously, which is hundreds of MB for a
+        # few thousand mentions.  Blocks keep the fusion a single scatter-add
+        # each while bounding that transient.
+        # ponytail: fixed block size, not tuned; lower it if the concept
+        # vocabulary per block grows past what a Colab runtime can hold.
+        queries_of_row: list[list[int]] = [[] for _ in range(rows)]
+        for query_index, row in enumerate(owner):
+            queries_of_row[row].append(query_index)
+
+        hit_debug: list[list[dict]] = [[] for _ in range(rows)]
         best_surface: list[dict[str, tuple[float, str]]] = [
             {} for _ in range(rows)
         ]
-        hit_debug: list[list[dict]] = [[] for _ in range(rows)]
-
         for query_index, hits in enumerate(hit_lists):
             row = owner[query_index]
             label = labels[query_index]
@@ -556,87 +567,106 @@ class EntityLinker:
                     hit.score == current[0] and hit.surface < current[1]
                 ):
                     best_surface[row][hit.cui] = (float(hit.score), hit.surface)
-            rank_list = concept_rank_list(hits)
-            ids: list[int] = []
-            ranks: list[int] = []
-            for cui, rank in rank_list.items():
-                column = concept_ids.get(cui)
-                if column is None:
-                    column = len(concept_ids)
-                    concept_ids[cui] = column
-                ids.append(column)
-                ranks.append(rank)
-            id_rows.append(ids)
-            rank_rows.append(ranks)
 
-        width = max((len(ids) for ids in id_rows), default=0)
-        cui_ids = np.full((len(id_rows), width), -1, dtype=np.int64)
-        rank_array = np.zeros((len(id_rows), width), dtype=np.float64)
-        for index, (ids, ranks) in enumerate(zip(id_rows, rank_rows)):
-            if not ids:
-                continue
-            cui_ids[index, : len(ids)] = ids
-            rank_array[index, : len(ranks)] = ranks
-
-        dense = rrf_score_matrix(
-            cui_ids,
-            rank_array,
-            np.asarray(scales, dtype=np.float64),
-            np.asarray(owner, dtype=np.int64),
-            rows,
-            max(len(concept_ids), 1),
-        )
-
-        # Back to CUIs, then the documented ordering: score desc, cui asc.
-        inverse = {column: cui for cui, column in concept_ids.items()}
         rankings: list[list[Candidate]] = []
         debugs: list[dict] = []
-        for row in range(rows):
-            scores = dense[row]
-            columns = np.flatnonzero(scores)
-            order = sorted(
-                columns.tolist(),
-                key=lambda column: (
-                    -float(scores[column]),
-                    inverse[column],
-                ),
-            )
-            ranking = [
-                Candidate(
-                    cui=inverse[column],
-                    score=float(scores[column]),
-                    surface=best_surface[row].get(
-                        inverse[column], (0.0, inverse[column])
-                    )[1],
-                )
-                for column in order
-            ]
-            rankings.append(ranking)
+        for block_start in range(0, rows, _RRF_ROW_BLOCK):
+            block_end = min(block_start + _RRF_ROW_BLOCK, rows)
+            block_rows = block_end - block_start
 
-            rank_lists_debug = {
-                labels[query_index]: {
-                    inverse[column]: rank
-                    for column, rank in zip(id_rows[query_index], rank_rows[query_index])
-                }
-                for query_index in range(len(hit_lists))
-                if owner[query_index] == row
-            }
-            debugs.append(
-                {
-                    "fusion": "rrf",
-                    "score_kind": "rrf",
-                    "top_k_retrieval": self.config.top_k_retrieval,
-                    "top_k_concept": self.config.top_k_concept,
-                    "index_size": len(self._index),
-                    "hits": hit_debug[row],
-                    "rank_lists": rank_lists_debug,
-                    "rrf_scores": {
-                        candidate.cui: float(candidate.score)
-                        for candidate in ranking
-                    },
-                    "concept_ranking": [_candidate_debug(c) for c in ranking],
-                }
+            concept_ids: dict[str, int] = {}
+            id_rows: list[list[int]] = []
+            rank_rows: list[list[int]] = []
+            block_queries: list[int] = []
+            block_owner: list[int] = []
+            for row in range(block_start, block_end):
+                for query_index in queries_of_row[row]:
+                    ids: list[int] = []
+                    ranks: list[int] = []
+                    for cui, rank in concept_rank_list(
+                        hit_lists[query_index]
+                    ).items():
+                        column = concept_ids.get(cui)
+                        if column is None:
+                            column = len(concept_ids)
+                            concept_ids[cui] = column
+                        ids.append(column)
+                        ranks.append(rank)
+                    block_queries.append(query_index)
+                    id_rows.append(ids)
+                    rank_rows.append(ranks)
+                    block_owner.append(row - block_start)
+
+            width = max((len(ids) for ids in id_rows), default=0)
+            cui_ids = np.full((len(id_rows), width), -1, dtype=np.int64)
+            rank_array = np.zeros((len(id_rows), width), dtype=np.float64)
+            for index, (ids, ranks) in enumerate(zip(id_rows, rank_rows)):
+                if not ids:
+                    continue
+                cui_ids[index, : len(ids)] = ids
+                rank_array[index, : len(ranks)] = ranks
+
+            dense = rrf_score_matrix(
+                cui_ids,
+                rank_array,
+                np.asarray(
+                    [scales[index] for index in block_queries], dtype=np.float64
+                ),
+                np.asarray(block_owner, dtype=np.int64),
+                block_rows,
+                max(len(concept_ids), 1),
             )
+
+            # Back to CUIs, then the documented ordering: score desc, cui asc.
+            inverse = {column: cui for cui, column in concept_ids.items()}
+            for row in range(block_start, block_end):
+                scores = dense[row - block_start]
+                columns = np.flatnonzero(scores)
+                order = sorted(
+                    columns.tolist(),
+                    key=lambda column: (
+                        -float(scores[column]),
+                        inverse[column],
+                    ),
+                )
+                ranking = [
+                    Candidate(
+                        cui=inverse[column],
+                        score=float(scores[column]),
+                        surface=best_surface[row].get(
+                            inverse[column], (0.0, inverse[column])
+                        )[1],
+                    )
+                    for column in order
+                ]
+                rankings.append(ranking)
+
+                rank_lists_debug = {
+                    labels[query_index]: {
+                        inverse[column]: rank
+                        for column, rank in zip(
+                            id_rows[position], rank_rows[position]
+                        )
+                    }
+                    for position, query_index in enumerate(block_queries)
+                    if block_owner[position] == row - block_start
+                }
+                debugs.append(
+                    {
+                        "fusion": "rrf",
+                        "score_kind": "rrf",
+                        "top_k_retrieval": self.config.top_k_retrieval,
+                        "top_k_concept": self.config.top_k_concept,
+                        "index_size": len(self._index),
+                        "hits": hit_debug[row],
+                        "rank_lists": rank_lists_debug,
+                        "rrf_scores": {
+                            candidate.cui: float(candidate.score)
+                            for candidate in ranking
+                        },
+                        "concept_ranking": [_candidate_debug(c) for c in ranking],
+                    }
+                )
         return rankings, debugs
 
     def _empty_rrf_debug(self) -> dict:

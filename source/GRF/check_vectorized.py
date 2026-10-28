@@ -183,57 +183,72 @@ def check_pipeline() -> None:
         Request(mention="std one", context="ctx", feedback_types=("std",)),
     ]
 
+    # The RRF fusion runs one dense row block at a time; shrink the block so
+    # the batch crosses several boundaries instead of staying in the first one.
+    import GRF.pipeline as pipeline_module
+
+    original_block = pipeline_module._RRF_ROW_BLOCK
+
     for fusion in ("vector", "rrf"):
         for index_kb in (None, "KB1"):
-            config = PipelineConfig(
-                fusion=fusion,
-                top_k_retrieval=7,
-                top_k_concept=5,
-                index_kb=index_kb,
-            )
-            one_at_a_time = EntityLinker(
-                index, _FakeEncoder(), config, feedback_generator=_FakeFeedback()
-            )
-            batched_encoder = _FakeEncoder()
-            batched = EntityLinker(
-                index, batched_encoder, config, feedback_generator=_FakeFeedback()
-            )
-            singles = [one_at_a_time.link(request) for request in requests]
-            together = batched.link_batch(requests)
-            tag = f"fusion={fusion} index_kb={index_kb}"
+            for block in ((original_block,) if fusion == "vector" else (2, original_block)):
+                pipeline_module._RRF_ROW_BLOCK = block
+                config = PipelineConfig(
+                    fusion=fusion,
+                    top_k_retrieval=7,
+                    top_k_concept=5,
+                    index_kb=index_kb,
+                )
+                one_at_a_time = EntityLinker(
+                    index, _FakeEncoder(), config, feedback_generator=_FakeFeedback()
+                )
+                batched_encoder = _FakeEncoder()
+                batched = EntityLinker(
+                    index, batched_encoder, config, feedback_generator=_FakeFeedback()
+                )
+                singles = [one_at_a_time.link(request) for request in requests]
+                together = batched.link_batch(requests)
+                tag = f"fusion={fusion} index_kb={index_kb} block={block}"
 
-            for row, (single, batch) in enumerate(zip(singles, together)):
-                assert single.cui == batch.cui, f"{tag} row={row}: cui"
-                assert [c.cui for c in single.candidates] == [
-                    c.cui for c in batch.candidates
-                ], f"{tag} row={row}: candidate order"
-                assert [c.surface for c in single.candidates] == [
-                    c.surface for c in batch.candidates
-                ], f"{tag} row={row}: candidate surfaces"
-                for left, right in zip(single.candidates, batch.candidates):
-                    assert abs(left.score - right.score) <= TOLERANCE, (
-                        f"{tag} row={row}: score {left.score} vs {right.score}"
-                    )
-                for key in ("weights", "feedback", "feedback_failures", "score_kind"):
-                    assert single.debug.get(key) == batch.debug.get(key), (
-                        f"{tag} row={row}: debug[{key}]"
-                    )
-                assert len(single.debug["concept_ranking"]) == len(
-                    batch.debug["concept_ranking"]
-                ), f"{tag} row={row}: concept_ranking length"
-                for left, right in zip(
-                    single.debug["concept_ranking"], batch.debug["concept_ranking"]
-                ):
-                    assert left["cui"] == right["cui"], f"{tag} row={row}: ranking cui"
-                    assert abs(left["score"] - right["score"]) <= TOLERANCE, (
-                        f"{tag} row={row}: ranking score"
-                    )
+                for row, (single, batch) in enumerate(zip(singles, together)):
+                    assert single.cui == batch.cui, f"{tag} row={row}: cui"
+                    assert [c.cui for c in single.candidates] == [
+                        c.cui for c in batch.candidates
+                    ], f"{tag} row={row}: candidate order"
+                    assert [c.surface for c in single.candidates] == [
+                        c.surface for c in batch.candidates
+                    ], f"{tag} row={row}: candidate surfaces"
+                    for left, right in zip(single.candidates, batch.candidates):
+                        assert abs(left.score - right.score) <= TOLERANCE, (
+                            f"{tag} row={row}: score {left.score} vs {right.score}"
+                        )
+                    for key in ("weights", "feedback", "feedback_failures", "score_kind"):
+                        assert single.debug.get(key) == batch.debug.get(key), (
+                            f"{tag} row={row}: debug[{key}]"
+                        )
+                    if fusion == "rrf":
+                        # The rank lists must survive the row blocking intact.
+                        assert single.debug["rank_lists"] == batch.debug["rank_lists"], (
+                            f"{tag} row={row}: rank_lists"
+                        )
+                    assert len(single.debug["concept_ranking"]) == len(
+                        batch.debug["concept_ranking"]
+                    ), f"{tag} row={row}: concept_ranking length"
+                    for left, right in zip(
+                        single.debug["concept_ranking"], batch.debug["concept_ranking"]
+                    ):
+                        assert left["cui"] == right["cui"], f"{tag} row={row}: ranking cui"
+                        assert abs(left["score"] - right["score"]) <= TOLERANCE, (
+                            f"{tag} row={row}: ranking score"
+                        )
 
-            # The batch must actually batch: one encoder call for all mentions
-            # plus one for all feedback texts, not one round per request.
-            assert batched_encoder.calls == 2, (
-                f"{tag}: {batched_encoder.calls} encoder calls, expected 2"
-            )
+                # The batch must actually batch: one encoder call for all
+                # mentions plus one for all feedback texts.
+                assert batched_encoder.calls == 2, (
+                    f"{tag}: {batched_encoder.calls} encoder calls, expected 2"
+                )
+
+    pipeline_module._RRF_ROW_BLOCK = original_block
 
 
 def main() -> None:
