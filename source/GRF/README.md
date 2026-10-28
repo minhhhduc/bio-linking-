@@ -196,37 +196,38 @@ GRF notebooks are in `GRF/`, and the dense baseline is in `baseline/`:
   Google Drive into the single-file artifact. A concept named `NaN` (for
   example C0549184) is the source KB's "none/no" answer and is embedded like
   any other row.
-- `retrieval.ipynb` loads the KB data, the artifact and the gold data from
+- `ranking.ipynb` loads the KB data, the artifact and the gold data from
   Drive, runs candidate retrieval, reports R@1/R@5, and saves every mention's
   candidates to one JSONL file (`candidates.save_candidates`).
-- `baseline.ipynb` encodes each mention and scans the same artifact directly
-  (`common.encoder` + `common.index`), with no feedback, fusion or LLM. It
-  reports R@1/R@5/accuracy and writes a candidate file in the same format.
-- `e2e.ipynb` reads only that candidate file, applies Top-1 or the LLM
+- `baseline/ranking.ipynb` encodes each mention and scans the same artifact
+  directly (`common.encoder` + `common.index`), with no feedback, fusion or
+  LLM. It reports R@1/R@5/accuracy and writes a candidate file in the same
+  format.
+- `reranking.ipynb` reads only that candidate file, applies Top-1 or the LLM
   re-ranker (`candidates.rerank_candidates`), and reports end-to-end accuracy;
   it never loads the encoder, the index or the KB artifact.
 
 Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
 data loading, re-ranking) drives a `tqdm` bar through the library's
 `progress_callback`; all four notebooks install `tqdm` explicitly, and
-`retrieval`/`e2e` also install `transformers` for the local LLM backend
-(`baseline` installs neither — it uses no LLM).
+`ranking`/`reranking` also install `transformers` for the local LLM backend
+(`baseline/ranking` installs neither — it uses no LLM).
 
-With `DEVICE = "cuda"`, `retrieval.ipynb` and `baseline.ipynb` keep one GPU copy of the index
-(`VectorIndex.use_gpu`) and scores queries with a batched matrix multiply; only
-rows at or above each k-th score return to CPU. If the copy does not fit, it
-logs a warning and uses the CPU scan.
+With `DEVICE = "cuda"`, `ranking.ipynb` and `baseline/ranking.ipynb` keep one
+GPU copy of the index (`VectorIndex.use_gpu`) and scores queries with a batched
+matrix multiply; only rows at or above each k-th score return to CPU. If the
+copy does not fit, it logs a warning and uses the CPU scan.
 
-**GPU residents.** `retrieval.ipynb` with a local feedback model holds three
+**GPU residents.** `ranking.ipynb` with a local feedback model holds three
 CUDA residents at once — the SapBERT encoder, the index copy, and the local
 LLM — and the LLM is loaded last, so an out-of-memory load shows up as
 per-kind feedback failures (silent degradation to `Q_0`) rather than a crash.
 On a 16 GB Colab GPU use a small model or `LLM_LOCAL_DEVICE = "cpu"`; a CPU
 feedback model costs VRAM nothing and only slows the feedback stage.
-`e2e.ipynb` holds only the re-ranker's model, but that model is still GPU state
-when `LLM_BACKEND = "local"` and `LLM_LOCAL_DEVICE = "cuda"`.
+`reranking.ipynb` holds only the re-ranker's model, but that model is still GPU
+state when `LLM_BACKEND = "local"` and `LLM_LOCAL_DEVICE = "cuda"`.
 
 Each notebook ends by dropping its large objects (`gc.collect`) and calling
-`unload()` on a local model; `build_KB`, `retrieval` and `baseline` also empty
-the CUDA cache (`release_gpu`, `torch.cuda.empty_cache`), and `e2e` does the
-same when a GPU is present.
+`unload()` on a local model; `build_KB`, `ranking` and the baseline's
+`ranking` also empty the CUDA cache (`release_gpu`, `torch.cuda.empty_cache`),
+and `reranking` does the same when a GPU is present.

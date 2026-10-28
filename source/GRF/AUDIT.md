@@ -39,7 +39,7 @@ tree without editing files:
   reachability, no remaining OpenAI-API dependency on the `"local"` path, and
   notebook cell-by-cell name resolution. It found the device/dtype ordering
   defect recorded below (fixed) and one false positive (a claimed `KeyError`
-  in `e2e.ipynb`'s failure comprehension; the `if` clause runs before the
+  in `reranking.ipynb`'s failure comprehension; the `if` clause runs before the
   output expression, so the `{}` shape cannot raise — verified, no change made).
 - A separate integration/data auditor `a0e56472123e21a1d` was dispatched. It
   produced no report before this record was written; **no findings from it are
@@ -154,7 +154,7 @@ the stale claims.
 - **Local LLM backend (`hf_llm.py`):** `timeout_s` is accepted and ignored — a
   local generation cannot be interrupted mid-step without leaving the CUDA
   context undefined, so a hung model stalls the feedback stage instead of
-  degrading. In `retrieval.ipynb` a local feedback model is a third CUDA
+  degrading. In `ranking.ipynb` a local feedback model is a third CUDA
   resident alongside the SapBERT encoder and the index's GPU copy, so an
   out-of-memory load degrades to per-kind feedback failures (silent `Q_0`
   fallback) rather than a crash. On a 16 GB Colab GPU use a small model or

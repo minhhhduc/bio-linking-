@@ -141,7 +141,7 @@ của nó lệch khỏi đúng row mà nó phải khớp. Baseline và GRF dùng
 (`SentenceTransformerEncoder.encode_mention_in_context`) cho $Q_0$, nên hai bên
 retrieve trên cùng một biểu diễn và số liệu so sánh được.
 
-Hai notebook retrieval có công tắc `USE_CONTEXT_QUERY`: `True` dùng công thức
+Hai notebook `ranking` (baseline và GRF) có công tắc `USE_CONTEXT_QUERY`: `True` dùng công thức
 trên; `False` bỏ ngữ cảnh và lấy $Q = E(m)$ bằng chính `encoder.encode` của thư
 viện — đúng hàm đã dựng index row.
 
