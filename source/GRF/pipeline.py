@@ -13,8 +13,10 @@ Implements architecture §5.2/§5.3 and reference_abstract §5:
   call that produces it does not L2-normalise.  The retrieval vector is
   normalised exactly once, after ``Q_GRF`` is formed, inside
   ``fusion.interpolate_matrix`` (architecture §4.4, §7.2).
-* Pipeline 2 (``fusion="rrf"``): one scan per query, concept-level rank lists,
-  then weighted reciprocal rank fusion.
+* Pipeline 2 (``fusion="rrf"``): one scan per query component -- ``Q_0`` then
+  each ``Q_Fi`` -- so a batch of mentions is scanned ``n+1`` times, once per
+  component, each scan holding the same ``b`` rows (architecture §7.3).  The
+  ``n+1`` rank matrices are then fused with weighted reciprocal rank fusion.
 * ``feedback_types=()`` degrades to plain dense retrieval (architecture §11).
 
 ``n`` in the fusion weights is the number of *successful feedback components*
@@ -55,8 +57,9 @@ _RRF_ROW_BLOCK = 256
 
 # ``link_batch`` progress phases, in execution order.  The unit differs per
 # phase, and a caller draws one bar each: mentions for feedback/aggregation/
-# ranking, index scans for retrieval, encoder calls (total=None) for the two
-# encoding phases.
+# ranking, index scans for retrieval (``1`` for vector fusion, ``n+1`` for
+# RRF, which scans once per query component), encoder calls (total=None) for
+# the two encoding phases.
 #
 # The last phase is **ranking**, not re-ranking: this notebook stops at the
 # ranking, and the saved candidate file is re-ranked later by
@@ -66,7 +69,7 @@ PROGRESS_PHASES = (
     "encode Q0",        # §7.1  encode the query (mention + context)
     "feedback",         # C5    generate F_def / F_syn / F_std
     "encode feedback",  # C3    embed every feedback text
-    "retrieval",        # §7.4  cosine matmul + top-k hits
+    "retrieval",        # §7.4  cosine matmul + top-k, one scan per Q_x
     "aggregation",      # §7.5  surface hits -> concept scores
     "ranking",          # §7.7  sort by score, cut to top_k_concept
 )
@@ -255,9 +258,12 @@ class EntityLinker:
         1. ``Q_0``: one encoder call for all mentions (§4.4).
         2. feedback: one batched LLM call for every prompt (§5).
         3. feedback embeddings: one encoder call for every feedback text.
-        4. fusion: ``Q_GRF = W · [Q_0; Q_F]``, a single contraction.
-        5. retrieval: one index scan (vector fusion) or ``n_i + 1`` (RRF).
-        6. aggregation: concept scores from the retrieved surface forms (§7.5).
+        4. fusion: ``Q_GRF = W · [Q_0; Q_F]``, a single contraction (vector);
+           no vector is formed in the RRF pipeline, only weights.
+        5. retrieval: one index scan (vector fusion) or ``n_i + 1`` scans, one
+           per query component ``Q_x``, each holding every mention (§7.3).
+        6. aggregation: concept scores from the retrieved surface forms (§7.5);
+           for RRF, the ``n_i + 1`` rank lists are fused here (§7.6).
         7. ranking: sort each concept ranking, cut to ``top_k_concept`` (§7.7).
            With ``rerank="top1"`` this only copies the ranking's first entry
            into ``Response.cui``; no re-ranking runs in the retrieval stage.
@@ -615,74 +621,135 @@ class EntityLinker:
     ) -> tuple[list[list[Candidate]], list[dict]]:
         """Pipeline 2 for the whole batch: ``n_i + 1`` scans, then one fusion.
 
-        Every query of every mention goes into a single ``search_batch`` call
-        (the scans are the matmuls ``Q_x · Aᵀ``).  The per-query concept rank
-        lists are then turned into one dense RRF matrix, so the fusion is a
-        single scatter-add instead of a Python dict per query.
+        Queries are laid out **component by component** (architecture §7.3):
+        batch 0 is ``Q_0`` over every mention, batch ``i`` is the ``i``-th
+        feedback vector of every mention that has one.  Each batch is its own
+        ``search_batch`` call, run in order, and each returns its own ranked
+        list -- the ``R_x`` the RRF formula sums over.
         """
         rows = len(q0_matrix)
         if len(component_vectors) != rows or len(weight_rows) != rows:
             raise ValueError("component/weight rows must match the batch size")
+        if len(labels_per_request) != rows:
+            raise ValueError("label rows must match the batch size")
+        if rows == 0:
+            return [], []
 
-        # Flatten every mention's queries into one matrix.
-        queries: list[np.ndarray] = []
-        owner: list[int] = []
-        labels: list[str] = []
-        scales: list[float] = []
-        for row, (row_vectors, row_labels, (w0, fw)) in enumerate(
-            zip(component_vectors, labels_per_request, weight_rows)
-        ):
-            if len(row_vectors) != len(row_labels) - 1:
-                raise ValueError("feedback vectors and labels must have equal length")
-            queries.append(np.asarray(q0_matrix[row], dtype=np.float64))
-            owner.append(row)
-            labels.append(row_labels[0])
-            scales.append(float(w0))
-            for label, vector, weight in zip(row_labels[1:], row_vectors, fw):
-                queries.append(np.asarray(vector, dtype=np.float64))
-                owner.append(row)
-                labels.append(label)
-                scales.append(float(weight))
+        batches = self._query_batches(
+            q0_matrix, component_vectors, labels_per_request, weight_rows
+        )
+        hits = self._scan_batches(batches, progress_callback)
+        return self._rrf_fuse(batches, hits, rows, progress_callback)
 
-        if not queries:
-            return [[] for _ in range(rows)], [
-                self._empty_rrf_debug() for _ in range(rows)
+    def _query_batches(
+        self,
+        q0_matrix: np.ndarray,
+        component_vectors: Sequence[Sequence[np.ndarray]],
+        labels_per_request: Sequence[Sequence[str]],
+        weight_rows: Sequence[tuple[float, Sequence[float]]],
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]]:
+        """The ``n+1`` query matrices ``Q_x``, one per component (§7.3).
+
+        Each entry is ``(rows, matrix, weights, labels)``: ``matrix[k]`` is the
+        query of mention ``rows[k]`` for this component and ``weights[k]`` is
+        its fusion weight ``1/(n_j+1)``.  A mention whose ``def`` call failed
+        is simply absent from the later batches, so ragged feedback counts need
+        no padding -- and one batch holds ``b`` rows instead of ``b(n+1)``.
+        """
+        rows = len(q0_matrix)
+        batches = [
+            (
+                np.arange(rows),
+                np.asarray(q0_matrix, dtype=np.float64),
+                np.array([weight_rows[row][0] for row in range(rows)]),
+                [labels_per_request[row][0] for row in range(rows)],
+            )
+        ]
+
+        depth = max((len(vectors) for vectors in component_vectors), default=0)
+        for index in range(depth):
+            present = [
+                row for row in range(rows) if len(component_vectors[row]) > index
             ]
+            if not present:
+                continue
+            if any(
+                len(component_vectors[row]) != len(labels_per_request[row]) - 1
+                for row in present
+            ):
+                raise ValueError(
+                    "feedback vectors and labels must have equal length"
+                )
+            batches.append(
+                (
+                    np.asarray(present, dtype=np.int64),
+                    np.stack(
+                        [
+                            np.asarray(component_vectors[row][index], dtype=np.float64)
+                            for row in present
+                        ]
+                    ),
+                    np.array(
+                        [weight_rows[row][1][index] for row in present],
+                        dtype=np.float64,
+                    ),
+                    [labels_per_request[row][1 + index] for row in present],
+                )
+            )
+        return batches
 
-        matrix = np.stack(queries)
-        self._report(progress_callback, "retrieval", 0, 1)
-        hit_lists = self._search_rows(matrix)
-        self._report(progress_callback, "retrieval", 1, 1)
+    def _scan_batches(self, batches, progress_callback) -> list[list[RetrievalHit]]:
+        """One index scan per component batch, in order; the ranked lists ``R_x``."""
+        hits: list[list[RetrievalHit]] = []
+        total = len(batches)
+        self._report(progress_callback, "retrieval", 0, total)
+        for done, (_, matrix, _, _) in enumerate(batches, start=1):
+            hits.append(self._search_rows(matrix))
+            self._report(progress_callback, "retrieval", done, total)
+        return hits
 
-        # Concept rank list per query -> dense (queries, |concepts|) id/rank
-        # arrays, **one row block at a time**.  The dense score matrix is
-        # (rows, |concepts|); building it for the whole gold set at once holds
-        # every mention's row simultaneously, which is hundreds of MB for a
-        # few thousand mentions.  Blocks keep the fusion a single scatter-add
-        # each while bounding that transient.
-        # ponytail: fixed block size, not tuned; lower it if the concept
-        # vocabulary per block grows past what a Colab runtime can hold.
-        queries_of_row: list[list[int]] = [[] for _ in range(rows)]
-        for query_index, row in enumerate(owner):
-            queries_of_row[row].append(query_index)
+    def _rrf_fuse(
+        self,
+        batches,
+        hits_per_batch: Sequence[Sequence[Sequence[RetrievalHit]]],
+        rows: int,
+        progress_callback,
+    ) -> tuple[list[list[Candidate]], list[dict]]:
+        """``RRF(c) = Σ_x w_x / r_x(c)`` over the per-component rank matrices.
+
+        The ranks of every component of one mention form the vector
+        ``(r_0(c), …, r_n(c))`` of the formula; the fusion is one dense
+        scatter-add per row block, ``S[r, c] = Σ_x w_x / r_x(c)``.
+        """
+        position_of: list[dict[int, int]] = [
+            {int(row): position for position, row in enumerate(batch_rows.tolist())}
+            for batch_rows, _, _, _ in batches
+        ]
+        rank_lists = [
+            [concept_rank_list(hits) for hits in hits_per_batch[index]]
+            for index in range(len(batches))
+        ]
 
         hit_debug: list[list[dict]] = [[] for _ in range(rows)]
         best_surface: list[dict[str, tuple[float, str]]] = [
             {} for _ in range(rows)
         ]
-        for query_index, hits in enumerate(hit_lists):
-            row = owner[query_index]
-            label = labels[query_index]
-            for hit in hits:
-                hit_debug[row].append(_hit_debug(hit, label))
-                current = best_surface[row].get(hit.cui)
-                if current is None or hit.score > current[0] or (
-                    hit.score == current[0] and hit.surface < current[1]
-                ):
-                    best_surface[row][hit.cui] = (float(hit.score), hit.surface)
+        for index, (batch_rows, _, _, labels) in enumerate(batches):
+            for position, (row, label) in enumerate(zip(batch_rows.tolist(), labels)):
+                for hit in hits_per_batch[index][position]:
+                    hit_debug[row].append(_hit_debug(hit, label))
+                    current = best_surface[row].get(hit.cui)
+                    if current is None or hit.score > current[0] or (
+                        hit.score == current[0] and hit.surface < current[1]
+                    ):
+                        best_surface[row][hit.cui] = (float(hit.score), hit.surface)
 
         rankings: list[list[Candidate]] = []
         debugs: list[dict] = []
+        # The dense score matrix is (rows, |concepts|); one block at a time
+        # bounds that transient for a large gold set.
+        # ponytail: fixed block size, not tuned; lower it if the concept
+        # vocabulary per block grows past what a Colab runtime can hold.
         for block_start in range(0, rows, _RRF_ROW_BLOCK):
             block_end = min(block_start + _RRF_ROW_BLOCK, rows)
             block_rows = block_end - block_start
@@ -690,25 +757,35 @@ class EntityLinker:
             concept_ids: dict[str, int] = {}
             id_rows: list[list[int]] = []
             rank_rows: list[list[int]] = []
-            block_queries: list[int] = []
             block_owner: list[int] = []
-            for row in range(block_start, block_end):
-                for query_index in queries_of_row[row]:
+            block_scale: list[float] = []
+            block_rank_lists: list[dict[str, dict[str, int]]] = [
+                {} for _ in range(block_rows)
+            ]
+            for index, (_, _, weights, labels) in enumerate(batches):
+                for row in range(block_start, block_end):
+                    position = position_of[index].get(row)
+                    if position is None:
+                        continue
+                    component_ranks = rank_lists[index][position]
+                    if not component_ranks:
+                        continue
+                    block_rank_lists[row - block_start][labels[position]] = dict(
+                        component_ranks
+                    )
                     ids: list[int] = []
                     ranks: list[int] = []
-                    for cui, rank in concept_rank_list(
-                        hit_lists[query_index]
-                    ).items():
+                    for cui, rank in component_ranks.items():
                         column = concept_ids.get(cui)
                         if column is None:
                             column = len(concept_ids)
                             concept_ids[cui] = column
                         ids.append(column)
                         ranks.append(rank)
-                    block_queries.append(query_index)
                     id_rows.append(ids)
                     rank_rows.append(ranks)
                     block_owner.append(row - block_start)
+                    block_scale.append(float(weights[position]))
 
             width = max((len(ids) for ids in id_rows), default=0)
             cui_ids = np.full((len(id_rows), width), -1, dtype=np.int64)
@@ -722,9 +799,7 @@ class EntityLinker:
             dense = rrf_score_matrix(
                 cui_ids,
                 rank_array,
-                np.asarray(
-                    [scales[index] for index in block_queries], dtype=np.float64
-                ),
+                np.asarray(block_scale, dtype=np.float64),
                 np.asarray(block_owner, dtype=np.int64),
                 block_rows,
                 max(len(concept_ids), 1),
@@ -753,17 +828,6 @@ class EntityLinker:
                     for column in order
                 ]
                 rankings.append(ranking)
-
-                rank_lists_debug = {
-                    labels[query_index]: {
-                        inverse[column]: rank
-                        for column, rank in zip(
-                            id_rows[position], rank_rows[position]
-                        )
-                    }
-                    for position, query_index in enumerate(block_queries)
-                    if block_owner[position] == row - block_start
-                }
                 debugs.append(
                     {
                         "fusion": "rrf",
@@ -772,7 +836,7 @@ class EntityLinker:
                         "top_k_concept": self.config.top_k_concept,
                         "index_size": len(self._index),
                         "hits": hit_debug[row],
-                        "rank_lists": rank_lists_debug,
+                        "rank_lists": block_rank_lists[row - block_start],
                         "rrf_scores": {
                             candidate.cui: float(candidate.score)
                             for candidate in ranking
@@ -782,19 +846,6 @@ class EntityLinker:
                 )
                 self._report(progress_callback, "aggregation", len(rankings), rows)
         return rankings, debugs
-
-    def _empty_rrf_debug(self) -> dict:
-        return {
-            "fusion": "rrf",
-            "score_kind": "rrf",
-            "top_k_retrieval": self.config.top_k_retrieval,
-            "top_k_concept": self.config.top_k_concept,
-            "index_size": len(self._index),
-            "hits": [],
-            "rank_lists": {},
-            "rrf_scores": {},
-            "concept_ranking": [],
-        }
 
     # ------------------------------------------------------------------
     # Pipelines
@@ -833,26 +884,21 @@ class EntityLinker:
         feedback_labels: Sequence[str],
         weights: Sequence[float],
     ) -> tuple[list[Candidate], dict]:
+        """Pipeline 2 for one mention, written the long way.
+
+        The readable form of ``_rrf_batch``: one scan per component, in order,
+        one rank list per scan, then :func:`fusion.rrf_scores` as a dict.  The
+        release check asserts this and the batched path agree.
+        """
         if len(feedback_vectors) != len(feedback_labels):
             raise ValueError("feedback vectors and labels must have equal length")
 
         labels = ["Q_0", *feedback_labels]
         queries = [q0, *feedback_vectors]
-        if hasattr(self._index, "search_batch"):
-            hit_lists = self._index.search_batch(
-                queries,
-                self.config.top_k_retrieval,
-                source_kb=self.config.index_kb,
-            )
-        else:  # custom index with only search()
-            hit_lists = [
-                self._index.search(
-                    vector,
-                    self.config.top_k_retrieval,
-                    source_kb=self.config.index_kb,
-                )
-                for vector in queries
-            ]
+        hit_lists = [
+            self._search_rows(np.asarray(query, dtype=np.float64)[None, :])[0]
+            for query in queries
+        ]
         searches = list(zip(labels, hit_lists))
 
         hit_debug: list[dict] = []

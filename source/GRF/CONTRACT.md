@@ -516,8 +516,8 @@ different unit per phase, so a caller can draw `PROGRESS_PHASES` as one bar
 each: `"encode Q0"` and `"encode feedback"` count encoder calls with
 `total=None` (the encoder batches internally); `"feedback"`, `"aggregation"`
 and `"ranking"` count mentions; `"retrieval"` counts index scans — `1` for
-both pipelines, because each is a single batched `search_batch` call (RRF's
-batch simply holds `n_i + 1` rows per mention).
+vector fusion, `n+1` for RRF, because RRF scans once per query component
+(§7.3: `Q_0`, then each `Q_Fi`).
 
 `metrics_from_responses` computes the same overall/per-label metrics from
 already-computed responses; `evaluate_all` delegates to it after one
@@ -525,8 +525,11 @@ already-computed responses; `evaluate_all` delegates to it after one
 
 Pipeline 1: fuse Q0 + Q_F (weights 1/(n+1)) -> one index scan
 (`top_k_retrieval`) -> max aggregation -> `top_k_concept` -> rerank.
-Pipeline 2: one batched index scan (`search_batch`) over Q0 and the feedback
-queries -> concept rank lists -> weighted RRF -> `top_k_concept` -> rerank. `feedback_types=()` degrades to dense retrieval.
+Pipeline 2: `n+1` index scans, **one per query component, in order** — batch 0
+holds every mention's `Q_0`, batch `i` holds every mention's `i`-th feedback
+vector — each returning its own rank matrix; then concept rank lists ->
+weighted RRF -> `top_k_concept` -> rerank. `feedback_types=()` degrades to
+dense retrieval.
 If every feedback call fails, use Q0 only. If `fusion`/`rerank` are invalid
 or `rerank="llm"` without a reranker, construction raises `ValueError`. When
 `rerank != "llm"`, an injected reranker is deliberately ignored and

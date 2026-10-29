@@ -329,10 +329,16 @@ def check_progress() -> None:
             assert counted == list(range(1, 6)), (
                 f"fusion={fusion} phase={phase}: {counted}"
             )
-        # The retrieval phase counts scans, not mentions.
-        assert {t for name, _, t in events if name == "retrieval"} == {1}, (
-            f"fusion={fusion}: retrieval reported {events}"
+        # The retrieval phase counts index scans: one for vector fusion, one
+        # per query component (``n+1``) for RRF.  These requests ask for a
+        # single ``def`` feedback, so RRF scans twice: ``Q_0`` then ``Q_def``.
+        scans = 1 if fusion == "vector" else 2
+        counted = [done for name, done, _ in events if name == "retrieval"]
+        totals = {t for name, _, t in events if name == "retrieval"}
+        assert counted == list(range(scans + 1)), (
+            f"fusion={fusion}: retrieval counted {counted}, expected {scans} scans"
         )
+        assert totals == {scans}, f"fusion={fusion}: retrieval total {totals}"
 
 
 def check_prompts() -> None:

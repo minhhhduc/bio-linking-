@@ -43,7 +43,11 @@ working. The dense baseline notebook uses `common/` only.
   `Q_GRF = w_0 Q_0 + Σ_i w_i Q_Fi` with every weight `w = 1/(n+1)`, where `n`
   is the number of successful feedback components; the sum is then
   L2-normalised, once.
-- Rank pipeline: `RRF(c) = w_0 / r_0(c) + Σ_i w_i / r_Fi(c)`, with
+- Rank pipeline: each mention has `n+1` separate query vectors (`Q_0`, then one
+  per feedback component); the batch is laid out **by component**, so `n+1`
+  query matrices are scanned in turn — batch 0 holds every mention's `Q_0`,
+  batch `i` every mention's `i`-th feedback vector — and each scan returns its
+  own rank matrix. Then `RRF(c) = w_0 / r_0(c) + Σ_i w_i / r_Fi(c)`, with
   `w_i = 1/(n+1)` and `1/r_x(c) = 0` when `c` is absent from list `x`.
   Concept rank lists are built with the same max-over-aliases aggregation.
 - Concept score: `Score(c) = max_{a ∈ A_c ∩ Top-k} S(a)`.

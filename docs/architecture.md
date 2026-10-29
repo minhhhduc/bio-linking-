@@ -193,13 +193,15 @@ m, s ──▶ E_ctx(m, s) = Q_0     ──▶ Search(Q_0, I)  = R_0
      ──▶ sort desc → top-k concept → re-ranker
 ```
 
-Đặc điểm: **n+1 lần quét index** (song song được), bù lại dung hợp theo thứ hạng bền vững hơn với khác biệt thang điểm giữa các query.
+Đặc điểm: **n+1 lần quét index, lần lượt theo từng component** (mỗi lần là một
+ma trận $Q_x$ của cả batch, §7.3), bù lại dung hợp theo thứ hạng bền vững hơn
+với khác biệt thang điểm giữa các query.
 
 ### 5.4. Chọn pipeline
 
 | Tiêu chí | Vector-based | Rank-based |
 | --- | --- | --- |
-| Số lần truy vấn index | 1 | $n+1$ |
+| Số lần truy vấn index | 1 | $n+1$ (mỗi lần một ma trận $Q_x$) |
 | Chi phí encode feedback | có | có |
 | Độ bền với lệch thang điểm | trung bình | cao |
 | Độ trễ | thấp | cao hơn |
@@ -215,6 +217,11 @@ Q ∈ R^{b × d}              # b query của một batch
 R  = Q · A^T               # (b × n_surface) cosine, vì mọi hàng đã unit-norm
 top-k theo từng hàng của R → candidate của mention đó
 ```
+
+Pipeline 1 gọi phép này **một lần** với $Q = Q_{\text{GRF}}$ của cả batch.
+Pipeline 2 gọi nó **n+1 lần**, lần thứ $x$ với $Q = Q_x$ (§7.3), nên mỗi lần
+vẫn là một phép ma trận duy nhất cho cả batch chứ không phải một vòng lặp
+mention.
 
 `VectorIndex.search_batch` thực hiện đúng phép này. Khi `use_gpu()` bật, phép
 nhân và `topk` chạy trên GPU theo chunk query; chỉ các hàng đạt top-k mới được
@@ -276,21 +283,55 @@ $$
 
 ### 7.3. Pha 2b: RRF retrieval (post-retrieval)
 
+$n$ feedback ⇒ $n+1$ vector embedding **rời nhau**, tính cả mention gốc:
+
+$$
+\vec{Q}_0 = E_{\text{ctx}}(m, s), \quad
+\vec{Q}_{F_1}, \ldots, \vec{Q}_{F_n}
+$$
+
+Batch hoá theo **component**, không theo mention: mỗi component là một ma trận
+$Q_x$ riêng, hàng là các mention của batch. Với batch $b$ mention, mỗi mention
+$n$ feedback (component thứ $i$ của mention $j$ là $\vec{Q}_i[j]$):
+
 $$
 \begin{aligned}
-Q_{\text{all}}[j] &= [Q_0[j]; Q_F[j, 1]; \ldots; Q_F[j, n_j]] && \in \mathbb{R}^{(n_j+1) \times d} \\
-\text{RRF}(c; j) &= \sum_{x=0}^{n_j} w_x \cdot \frac{1}{r_x(c)} && \text{where } \frac{1}{r_x(c)} = 0 \text{ if } c \notin R_x
+Q_0 &= \begin{bmatrix} \vec{Q}_0[1] \\ \vdots \\ \vec{Q}_0[b] \end{bmatrix}
+\in \mathbb{R}^{b \times d},
+&
+Q_1 &= \begin{bmatrix} \vec{Q}_1[1] \\ \vdots \\ \vec{Q}_1[b] \end{bmatrix}
+\in \mathbb{R}^{b \times d},
+& \ldots,
+&
+Q_n &= \begin{bmatrix} \vec{Q}_n[1] \\ \vdots \\ \vec{Q}_n[b] \end{bmatrix}
+\in \mathbb{R}^{b \times d}
 \end{aligned}
 $$
 
-Với mọi $j$, scan index $(n_j + 1)$ lần song song (batch); mỗi query trả về rank list $R_x$.
+Hàng $j$ của $Q_0$ là embedding mention $j$; hàng $j$ của $Q_i$ là embedding
+feedback thứ $i$ của mention $j$.
+
+**Retrieval lần lượt**: quét index $n+1$ lần, lần lượt theo component, mỗi lần
+dùng đúng công thức retrieval batch §7.4 với $Q_x$ — thu về $n+1$ ma trận thứ
+hạng, mỗi ma trận $b$ hàng:
+
+$$
+R_x = \text{CosineTopK}(Q_x, A) \in \mathbb{R}^{b \times k},
+\quad x = 0, \ldots, n
+$$
+
+Mỗi hàng $j$ của $R_x$ là danh sách hit của $\vec{Q}_x[j]$; sau §7.5 mỗi hàng
+trở thành rank list $R_x[j] = \{c \mapsto r_x(c)\}$.
+
+Feedback lỗi ⇒ mention đó vắng mặt ở batch về sau, không pad giả: mention có
+$n_j$ feedback thì đóng góp đúng $n_j+1$ rank list, trọng số $1/(n_j+1)$.
 
 ### 7.4. Pha 3: Matmul + top-k (vectorized)
 
 $$
 \begin{aligned}
 A &\in \mathbb{R}^{N \times d} && \text{(index matrix, } N \text{ surface forms)} \\
-Q &\in \mathbb{R}^{m \times d} && \text{(queries: } Q_{\text{GRF}} \text{ hoặc } Q_{\text{all}} \text{ flat)} \\
+Q &\in \mathbb{R}^{m \times d} && \text{(queries: } Q_{\text{GRF}} \text{, hoặc } Q_x \text{ của §7.3)} \\
 S &= Q \cdot A^\top \in \mathbb{R}^{m \times N} && \text{(cosine scores, cả 2 bên unit-norm)} \\
 \text{top-}k(S[i, :]) &\to \{(a, s_{ia})\}_{a \in \text{Top-}k} && \text{per query row } i
 \end{aligned}
@@ -313,14 +354,19 @@ Triển khai: một lượt `np.lexsort` trên khoá $(-\text{score}, \text{cui}
 
 ### 7.6. Pha 5: RRF fusion (nếu dùng pipeline 2)
 
+Với mention $j$, vector thứ hạng của khái niệm $c$ là
+$\big( r_0(c), r_1(c), \ldots, r_{n_j}(c) \big)$ — đúng một thành phần cho mỗi
+lần retrieval ở §7.3:
+
 $$
-\begin{aligned}
-r_x(c) &= \text{rank của } c \text{ trong } R_x \quad \text{(1-based, hoặc } \infty \text{)} \\
-\text{RRF}(c) &= \sum_{x=0}^{n} w_x \cdot \frac{1}{r_x(c)} && w_x = \frac{1}{n+1}
-\end{aligned}
+\text{RRF}(c) = \sum_{x=0}^{n_j} w_x \cdot \frac{1}{r_x(c)},
+\qquad w_x = \frac{1}{n_j+1},
+\qquad \frac{1}{r_x(c)} = 0 \text{ nếu } c \notin R_x
 $$
 
-Rank list $R_x$ được tính từ hits của query $x$ bằng aggregation pha 5, rồi assign rank 1-based. Fusion là **một** scatter-add: dựng mảng phẳng `owner * n_concepts + cui_id` và cộng $w_x / r_x(c)$ bằng `np.bincount`, thu được ma trận điểm $(b \times |\mathcal{C}|)$ trong một lượt thay vì một dict cho mỗi query.
+Dùng đúng ma trận thứ hạng của §7.3: dựng mảng phẳng `owner * n_concepts + cui_id`
+và cộng $w_x / r_x(c)$ bằng `np.bincount`, thu về ma trận điểm $(b \times |\mathcal{C}|)$
+— một scatter-add cho cả $n+1$ rank list, không phải một dict mỗi query.
 
 ### 7.7. Sắp xếp cuối và top-k concept
 
