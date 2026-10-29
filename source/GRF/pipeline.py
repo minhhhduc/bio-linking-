@@ -52,20 +52,20 @@ _RRF_ROW_BLOCK = 256
 
 # ``link_batch`` progress phases, in execution order.  The unit differs per
 # phase, and a caller draws one bar each: mentions for feedback/aggregation/
-# assembly, index scans for retrieval, encoder calls (total=None) for the two
+# ranking, index scans for retrieval, encoder calls (total=None) for the two
 # encoding phases.
 #
-# The last phase is **assembly**, not re-ranking: this notebook stops at the
+# The last phase is **ranking**, not re-ranking: this notebook stops at the
 # ranking, and the saved candidate file is re-ranked later by
 # ``reranking.ipynb``.  ``config.rerank == "top1"`` only fills ``Response.cui``
-# with the ranking's first entry, so no re-ranking work happens here.
+# with the ranking's first entry, so no re-ranking work runs here.
 PROGRESS_PHASES = (
-    "encode Q0",
-    "feedback",
-    "encode feedback",
-    "retrieval",
-    "aggregation",
-    "assembly",
+    "encode Q0",        # §7.1  encode the query (mention + context)
+    "feedback",         # C5    generate F_def / F_syn / F_std
+    "encode feedback",  # C3    embed every feedback text
+    "retrieval",        # §7.4  cosine matmul + top-k hits
+    "aggregation",      # §7.5  surface hits -> concept scores
+    "ranking",          # §7.7  sort by score, cut to top_k_concept
 )
 
 
@@ -229,11 +229,10 @@ class EntityLinker:
         3. feedback embeddings: one encoder call for every feedback text.
         4. fusion: ``Q_GRF = W · [Q_0; Q_F]``, a single contraction.
         5. retrieval: one index scan (vector fusion) or ``n_i + 1`` (RRF).
-        6. aggregation: concept scores from the retrieved surface forms.
-        7. assembly: one ``Response`` per mention, truncated to
-           ``top_k_concept``.  With ``rerank="top1"`` this only copies the
-           ranking's first entry into ``Response.cui``; no re-ranking runs in
-           the retrieval stage.
+        6. aggregation: concept scores from the retrieved surface forms (§7.5).
+        7. ranking: sort each concept ranking, cut to ``top_k_concept`` (§7.7).
+           With ``rerank="top1"`` this only copies the ranking's first entry
+           into ``Response.cui``; no re-ranking runs in the retrieval stage.
 
         Phase 2 is the only per-mention phase, so it is the only one that
         parallelises: each mention's round trips occupy a worker and the
@@ -336,7 +335,7 @@ class EntityLinker:
                     debug,
                 )
             )
-            self._report(progress_callback, "assembly", done, total)
+            self._report(progress_callback, "ranking", done, total)
         return responses
 
     @staticmethod

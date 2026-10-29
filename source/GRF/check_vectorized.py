@@ -231,9 +231,12 @@ def check_pipeline() -> None:
                         )
                     if fusion == "rrf":
                         # The rank lists must survive the row blocking intact.
-                        assert single.debug["rank_lists"] == batch.debug["rank_lists"], (
-                            f"{tag} row={row}: rank_lists"
-                        )
+                        # ``link`` keeps the per-pipeline debug under
+                        # ``debug["retrieval"]``; ``link_batch`` does the same.
+                        assert (
+                            single.debug["retrieval"]["rank_lists"]
+                            == batch.debug["retrieval"]["rank_lists"]
+                        ), f"{tag} row={row}: rank_lists"
                     assert len(single.debug["concept_ranking"]) == len(
                         batch.debug["concept_ranking"]
                     ), f"{tag} row={row}: concept_ranking length"
@@ -286,12 +289,15 @@ def check_progress() -> None:
         )
 
         seen = list(dict.fromkeys(phase for phase, _, _ in events))
-        interesting = [p for p in seen if p != "encode Q0"]
-        assert interesting == [p for p in PROGRESS_PHASES if p in seen], (
+        # Every phase must report, in PROGRESS_PHASES order.
+        assert seen == [p for p in PROGRESS_PHASES if p in seen], (
             f"fusion={fusion}: phases reported out of order: {seen}"
         )
-        # Feedback, aggregation and assembly each count all five mentions once.
-        for phase in ("feedback", "aggregation", "assembly"):
+        assert seen == list(PROGRESS_PHASES), (
+            f"fusion={fusion}: missing phases, got {seen}"
+        )
+        # Feedback, aggregation and ranking each count all five mentions.
+        for phase in ("feedback", "aggregation", "ranking"):
             counted = [done for name, done, _ in events if name == phase]
             assert counted == list(range(1, 6)), (
                 f"fusion={fusion} phase={phase}: {counted}"
