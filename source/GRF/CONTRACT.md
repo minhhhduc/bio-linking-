@@ -415,7 +415,7 @@ def evaluate_by_label(linker, samples) -> dict[str | None, Metrics]
 different unit per phase, so a caller can draw `PROGRESS_PHASES` as one bar
 each: `"encode Q0"` and `"encode feedback"` count encoder calls with
 `total=None` (the encoder batches internally); `"feedback"`, `"aggregation"`
-and `"rerank"` count mentions; `"retrieval"` counts index scans — `1` for
+and `"assembly"` count mentions; `"retrieval"` counts index scans — `1` for
 both pipelines, because each is a single batched `search_batch` call (RRF's
 batch simply holds `n_i + 1` rows per mention).
 

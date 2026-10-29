@@ -290,8 +290,8 @@ def check_progress() -> None:
         assert interesting == [p for p in PROGRESS_PHASES if p in seen], (
             f"fusion={fusion}: phases reported out of order: {seen}"
         )
-        # Feedback, aggregation and rerank each count all five mentions once.
-        for phase in ("feedback", "aggregation", "rerank"):
+        # Feedback, aggregation and assembly each count all five mentions once.
+        for phase in ("feedback", "aggregation", "assembly"):
             counted = [done for name, done, _ in events if name == phase]
             assert counted == list(range(1, 6)), (
                 f"fusion={fusion} phase={phase}: {counted}"

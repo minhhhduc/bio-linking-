@@ -52,15 +52,20 @@ _RRF_ROW_BLOCK = 256
 
 # ``link_batch`` progress phases, in execution order.  The unit differs per
 # phase, and a caller draws one bar each: mentions for feedback/aggregation/
-# rerank, index scans for retrieval, encoder calls (total=None) for the two
+# assembly, index scans for retrieval, encoder calls (total=None) for the two
 # encoding phases.
+#
+# The last phase is **assembly**, not re-ranking: this notebook stops at the
+# ranking, and the saved candidate file is re-ranked later by
+# ``reranking.ipynb``.  ``config.rerank == "top1"`` only fills ``Response.cui``
+# with the ranking's first entry, so no re-ranking work happens here.
 PROGRESS_PHASES = (
     "encode Q0",
     "feedback",
     "encode feedback",
     "retrieval",
     "aggregation",
-    "rerank",
+    "assembly",
 )
 
 
@@ -225,7 +230,10 @@ class EntityLinker:
         4. fusion: ``Q_GRF = W · [Q_0; Q_F]``, a single contraction.
         5. retrieval: one index scan (vector fusion) or ``n_i + 1`` (RRF).
         6. aggregation: concept scores from the retrieved surface forms.
-        7. re-ranking: one call per mention on its candidate list.
+        7. assembly: one ``Response`` per mention, truncated to
+           ``top_k_concept``.  With ``rerank="top1"`` this only copies the
+           ranking's first entry into ``Response.cui``; no re-ranking runs in
+           the retrieval stage.
 
         Phase 2 is the only per-mention phase, so it is the only one that
         parallelises: each mention's round trips occupy a worker and the
@@ -328,7 +336,7 @@ class EntityLinker:
                     debug,
                 )
             )
-            self._report(progress_callback, "rerank", done, total)
+            self._report(progress_callback, "assembly", done, total)
         return responses
 
     @staticmethod
