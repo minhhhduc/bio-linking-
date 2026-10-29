@@ -14,6 +14,9 @@ Progress convention: every record-scanning function the notebooks run takes an
 optional `progress_callback(done, total)`; `total` may be `None` when unknown.
 Callers that already counted the input pass an explicit `total` so the bar has
 a percentage. The notebooks render these callbacks with `tqdm`.
+`EntityLinker.link_batch` is the exception: it runs several phases with
+different units, so its callback is `progress_callback(phase, done, total)`
+(see the pipeline section below).
 `concepts_from_dataset` (CLI-only gold-to-KB derivation) has no callback.
 
 ## common/schemas.py
@@ -399,7 +402,6 @@ class EntityLinker:
                  concept_names: Mapping[str, str] | None = None): ...
     def link(self, request: Request) -> Response
     def link_batch(self, requests, *, progress_callback=None) -> list[Response]
-
 class Metrics: n, recall_at_1, recall_at_5, accuracy
 def evaluate(linker, samples) -> Metrics
 def evaluate_all(linker, samples, *, progress_callback=None
@@ -408,6 +410,14 @@ def metrics_from_responses(samples, responses
                            ) -> tuple[Metrics, dict[str | None, Metrics]]
 def evaluate_by_label(linker, samples) -> dict[str | None, Metrics]
 ```
+
+`link_batch` reports through `progress_callback(phase, done, total)` — a
+different unit per phase, so a caller can draw `PROGRESS_PHASES` as one bar
+each: `"encode Q0"` and `"encode feedback"` count encoder calls with
+`total=None` (the encoder batches internally); `"feedback"`, `"aggregation"`
+and `"rerank"` count mentions; `"retrieval"` counts index scans — `1` for
+both pipelines, because each is a single batched `search_batch` call (RRF's
+batch simply holds `n_i + 1` rows per mention).
 
 `metrics_from_responses` computes the same overall/per-label metrics from
 already-computed responses; `evaluate_all` delegates to it after one

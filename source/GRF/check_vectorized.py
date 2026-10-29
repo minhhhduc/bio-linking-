@@ -14,6 +14,9 @@ Two properties, both release-blocking:
    fusion modes.  Raw score floats are compared with a tolerance because a
    1-row and an N-row BLAS GEMM reduce in a different order (CONTRACT.md:
    "scores can differ in the last float32 ULPs").
+
+A third check locks the progress contract: ``link_batch`` reports each phase
+under its own name, so one bar can be drawn per phase.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from GRF.config import PipelineConfig  # noqa: E402
 from GRF.index import VectorIndex  # noqa: E402
-from GRF.pipeline import EntityLinker  # noqa: E402
+from GRF.pipeline import PROGRESS_PHASES, EntityLinker  # noqa: E402
 from GRF.schemas import Feedback, FeedbackFailure, Request  # noqa: E402
 
 TOLERANCE = 1e-6
@@ -251,11 +254,61 @@ def check_pipeline() -> None:
     pipeline_module._RRF_ROW_BLOCK = original_block
 
 
+def check_progress() -> None:
+    """``link_batch`` reports each phase separately, in ``PROGRESS_PHASES`` order.
+
+    One bar per phase is a contract: the callback carries the phase name, so a
+    caller can label it.  A phase that reported under another phase's name (the
+    original bug: feedback counted into a "retrieval" bar) fails here.
+    """
+    rng = np.random.default_rng(11)
+    count = 40
+    vectors = rng.normal(size=(count, 16)).astype(np.float32)
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    index = VectorIndex(
+        vectors,
+        [f"C{i:03d}" for i in range(count)],
+        [f"S{i}" for i in range(count)],
+    )
+    requests = [
+        Request(mention=f"m{i}", context=f"ctx {i}", feedback_types=("def",))
+        for i in range(5)
+    ]
+
+    for fusion in ("vector", "rrf"):
+        config = PipelineConfig(fusion=fusion, top_k_retrieval=5, top_k_concept=3)
+        linker = EntityLinker(
+            index, _FakeEncoder(), config, feedback_generator=_FakeFeedback()
+        )
+        events: list[tuple[str, int, int | None]] = []
+        linker.link_batch(
+            requests, progress_callback=lambda p, d, t: events.append((p, d, t))
+        )
+
+        seen = list(dict.fromkeys(phase for phase, _, _ in events))
+        interesting = [p for p in seen if p != "encode Q0"]
+        assert interesting == [p for p in PROGRESS_PHASES if p in seen], (
+            f"fusion={fusion}: phases reported out of order: {seen}"
+        )
+        # Feedback, aggregation and rerank each count all five mentions once.
+        for phase in ("feedback", "aggregation", "rerank"):
+            counted = [done for name, done, _ in events if name == phase]
+            assert counted == list(range(1, 6)), (
+                f"fusion={fusion} phase={phase}: {counted}"
+            )
+        # The retrieval phase counts scans, not mentions.
+        assert {t for name, _, t in events if name == "retrieval"} == {1}, (
+            f"fusion={fusion}: retrieval reported {events}"
+        )
+
+
 def main() -> None:
     check_index()
     print("index: OK")
     check_pipeline()
     print("pipeline: OK")
+    check_progress()
+    print("progress: OK")
     print("OK")
 
 

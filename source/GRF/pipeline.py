@@ -50,6 +50,19 @@ from .schemas import (
 # matrix; 256 rows keeps that transient near 100 MB for a 50k-concept KB.
 _RRF_ROW_BLOCK = 256
 
+# ``link_batch`` progress phases, in execution order.  The unit differs per
+# phase, and a caller draws one bar each: mentions for feedback/aggregation/
+# rerank, index scans for retrieval, encoder calls (total=None) for the two
+# encoding phases.
+PROGRESS_PHASES = (
+    "encode Q0",
+    "feedback",
+    "encode feedback",
+    "retrieval",
+    "aggregation",
+    "rerank",
+)
+
 
 def _as_vector_list(vector: np.ndarray) -> list[float]:
     """JSON-friendly Python floats (debug output)."""
@@ -212,6 +225,7 @@ class EntityLinker:
         4. fusion: ``Q_GRF = W · [Q_0; Q_F]``, a single contraction.
         5. retrieval: one index scan (vector fusion) or ``n_i + 1`` (RRF).
         6. aggregation: concept scores from the retrieved surface forms.
+        7. re-ranking: one call per mention on its candidate list.
 
         Phase 2 is the only per-mention phase, so it is the only one that
         parallelises: each mention's round trips occupy a worker and the
@@ -219,9 +233,9 @@ class EntityLinker:
         calls would only contend for the same device).
         ``feedback_workers`` bounds that pool.
 
-        ``progress_callback(done, total)``, when supplied, is called as each
-        mention finishes feedback generation, or after each linked request
-        when no feedback was requested.
+        ``progress_callback(phase, done, total)``, when supplied, is called
+        by each phase with its own unit, so a caller can draw one bar per
+        phase (``PROGRESS_PHASES`` lists them in order).
         """
         if progress_callback is not None and not callable(progress_callback):
             raise ValueError("progress_callback must be callable or None")
@@ -233,7 +247,9 @@ class EntityLinker:
         reports_feedback = any(kinds_per_request)
 
         # Phase 1 — Q_0 for the whole batch in one encoder call.
+        self._report(progress_callback, "encode Q0", 0, None)
         q0_matrix = self._encode_q0(items)
+        self._report(progress_callback, "encode Q0", 1, None)
 
         # Phase 2 — feedback text per mention.  The only per-mention phase, and
         # the expensive one: every mention's LLM round trips run concurrently
@@ -256,8 +272,7 @@ class EntityLinker:
                     index = futures[future]
                     outcomes[index] = future.result()
                     done += 1
-                    if progress_callback is not None:
-                        progress_callback(done, total)
+                    self._report(progress_callback, "feedback", done, total)
         feedbacks = [outcome[0] for outcome in outcomes]
         failures = [outcome[1] for outcome in outcomes]
 
@@ -265,7 +280,9 @@ class EntityLinker:
         specs_per_request = [
             self._component_specs(row_feedbacks) for row_feedbacks in feedbacks
         ]
+        self._report(progress_callback, "encode feedback", 0, None)
         component_vectors = self._encode_components(specs_per_request)
+        self._report(progress_callback, "encode feedback", 1, None)
 
         # Phase 4 — fusion weights, one row per mention (all 1/(n_i+1)).
         weight_rows = [
@@ -278,11 +295,15 @@ class EntityLinker:
         # Phases 5-6 — retrieval and concept aggregation over the batch.
         if self.config.fusion == "vector":
             rankings, retrieval_debugs = self._vector_batch(
-                q0_matrix, component_vectors, weight_rows
+                q0_matrix, component_vectors, weight_rows, progress_callback
             )
         else:
             rankings, retrieval_debugs = self._rrf_batch(
-                q0_matrix, component_vectors, labels_per_request, weight_rows
+                q0_matrix,
+                component_vectors,
+                labels_per_request,
+                weight_rows,
+                progress_callback,
             )
 
         # Phase 7 — assemble responses (re-ranking is the configured stage).
@@ -307,9 +328,14 @@ class EntityLinker:
                     debug,
                 )
             )
-            if progress_callback is not None and not reports_feedback:
-                progress_callback(done, total)
+            self._report(progress_callback, "rerank", done, total)
         return responses
+
+    @staticmethod
+    def _report(progress_callback, phase: str, done: int, total: int | None) -> None:
+        """Emit one per-phase progress event; a no-op without a callback."""
+        if progress_callback is not None:
+            progress_callback(phase, done, total)
 
     # ------------------------------------------------------------------
     # Batched phases shared by link() and link_batch()
@@ -491,12 +517,16 @@ class EntityLinker:
         q0_matrix: np.ndarray,
         component_vectors: Sequence[Sequence[np.ndarray]],
         weight_rows: Sequence[tuple[float, Sequence[float]]],
+        progress_callback=None,
     ) -> tuple[list[list[Candidate]], list[dict]]:
         """Pipeline 1 for the whole batch: one fusion, one index scan.
 
         Fusion is a single contraction ``Q_GRF = W · [Q_0; Q_F]`` and the
         retrieval is a single ``search_batch`` call, so the batch costs one
         matmul over the index instead of one per mention.
+
+        Reports ``"retrieval"`` (one scan) and ``"aggregation"`` (one row per
+        mention) as separate phases.
         """
         rows = len(q0_matrix)
         if len(component_vectors) != rows or len(weight_rows) != rows:
@@ -506,10 +536,13 @@ class EntityLinker:
         scales = [np.asarray([w0, *fw], dtype=np.float64) for w0, fw in weight_rows]
         fused = interpolate_matrix(q0_matrix, blocks, scales)
 
+        self._report(progress_callback, "retrieval", 0, 1)
         hit_lists = self._search_rows(fused)
+        self._report(progress_callback, "retrieval", 1, 1)
+
         rankings: list[list[Candidate]] = []
         debugs: list[dict] = []
-        for hits in hit_lists:
+        for done, hits in enumerate(hit_lists, start=1):
             ranking = aggregate_hits(hits)
             rankings.append(ranking)
             debugs.append(
@@ -523,6 +556,7 @@ class EntityLinker:
                     "concept_ranking": [_candidate_debug(c) for c in ranking],
                 }
             )
+            self._report(progress_callback, "aggregation", done, rows)
         return rankings, debugs
 
     def _rrf_batch(
@@ -531,6 +565,7 @@ class EntityLinker:
         component_vectors: Sequence[Sequence[np.ndarray]],
         labels_per_request: Sequence[Sequence[str]],
         weight_rows: Sequence[tuple[float, Sequence[float]]],
+        progress_callback=None,
     ) -> tuple[list[list[Candidate]], list[dict]]:
         """Pipeline 2 for the whole batch: ``n_i + 1`` scans, then one fusion.
 
@@ -569,7 +604,9 @@ class EntityLinker:
             ]
 
         matrix = np.stack(queries)
+        self._report(progress_callback, "retrieval", 0, 1)
         hit_lists = self._search_rows(matrix)
+        self._report(progress_callback, "retrieval", 1, 1)
 
         # Concept rank list per query -> dense (queries, |concepts|) id/rank
         # arrays, **one row block at a time**.  The dense score matrix is
@@ -697,6 +734,7 @@ class EntityLinker:
                         "concept_ranking": [_candidate_debug(c) for c in ranking],
                     }
                 )
+                self._report(progress_callback, "aggregation", len(rankings), rows)
         return rankings, debugs
 
     def _empty_rrf_debug(self) -> dict:

@@ -43,7 +43,11 @@ def _link(
     samples: Sequence[MentionSample],
     progress_callback=None,
 ) -> Sequence[Response]:
-    """Run the pipeline once and enforce a one-response-per-sample contract."""
+    """Run the pipeline once and enforce a one-response-per-sample contract.
+
+    ``progress_callback`` is forwarded as-is: ``link_batch`` calls it with
+    ``(phase, done, total)``.
+    """
     requests = make_requests(samples, linker.config)
     if progress_callback is None:
         responses = linker.link_batch(requests)
