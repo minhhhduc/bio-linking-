@@ -21,6 +21,31 @@ from .schemas import Concept, RetrievalHit
 # Written into single-file artifacts so a future format change can be detected.
 SINGLE_FILE_FORMAT = "grf-vector-index-npz-v1"
 
+# A row whose norm is this close to 1 is already unit-length: rescaling it
+# would be a second normalisation of the same vector, not a rounding fix.
+_UNIT_TOLERANCE = 1e-6
+
+
+def as_unit_rows(matrix: np.ndarray) -> np.ndarray:
+    """Scale rows to unit length, leaving rows that already are unit *as given*.
+
+    A cosine scan wants unit rows on both sides, and the index normalises what
+    it is handed.  The query it is handed is normally ``Q_GRF``, which the
+    fusion already normalised after the weighted sum — dividing that again
+    would be the second normalisation of the same retrieval vector.  Rows that
+    are not unit-length (a raw component, a caller's unnormalised query) are
+    scaled once here, which is the only normalisation they get.
+    """
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    needs_scale = (np.abs(norms - 1.0) > _UNIT_TOLERANCE).ravel()
+    if not np.any(needs_scale):
+        return matrix
+    scaled = np.array(matrix, dtype=matrix.dtype, copy=True)
+    scaled[needs_scale] = (
+        matrix[needs_scale] / norms[needs_scale]
+    )
+    return scaled
+
 
 class VectorIndex:
     """One entry per KB surface form; exact cosine scan at query time."""
@@ -111,7 +136,10 @@ class VectorIndex:
             norms = np.linalg.norm(array, axis=1, keepdims=True)
             if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
                 raise ValueError("vectors contain a zero-norm row")
-            array = array / norms
+            # Rows that arrive unit-length (``encoder.encode`` normalises them
+            # once) are stored as given; only a raw row is scaled, and then
+            # exactly once.
+            array = as_unit_rows(array)
 
         self.vectors = array.astype(np.float32, copy=False)
         self.cuis = cuis
@@ -281,9 +309,10 @@ class VectorIndex:
         empty: list[list[RetrievalHit]] = [[] for _ in range(matrix.shape[0])]
         if count == 0:
             return empty
-        # Rows are validated non-zero in search_batch; unit-norm makes the dot
-        # product a cosine (the index rows are already unit-norm).
-        matrix = matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
+        # Rows are validated non-zero in search_batch.  Already-unit rows (the
+        # normal case: the fusion normalised Q_GRF once) are used unchanged, so
+        # this is not a second normalisation of the same vector.
+        matrix = as_unit_rows(matrix)
 
         # Rows of the index that are eligible for this search.  When a
         # source_kb filter is given, the eligible rows form a compact matrix,
@@ -404,6 +433,10 @@ class VectorIndex:
         :meth:`use_gpu` active, the product and ``topk`` run on the device in
         query chunks and only rows at or above each k-th score are copied back
         to CPU; float32 scores can differ in the last ULPs from the CPU path.
+
+        Query rows that are already unit-length are scored **as given**: the
+        fusion normalises ``Q_GRF`` once after the weighted sum, and scaling it
+        again here would be a second normalisation of the same vector.
         """
         self._validate_top_k(top_k)
         self._validate_source_kb(source_kb)
@@ -422,6 +455,7 @@ class VectorIndex:
         norms = np.linalg.norm(matrix, axis=1)
         if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
             raise ValueError("every query must have a non-zero norm")
+        matrix = as_unit_rows(matrix)
         if self._device is not None:
             return self._search_gpu(matrix, top_k, source_kb)
         return self._search_cpu(matrix, top_k, source_kb)
@@ -470,9 +504,9 @@ class VectorIndex:
                 queries = torch.from_numpy(
                     np.ascontiguousarray(chunk)
                 ).to(device)
-                queries = queries / queries.norm(
-                    dim=1, keepdim=True
-                ).clamp_min(torch.finfo(queries.dtype).tiny)
+                # ``search_batch`` already made every row unit-length (and left
+                # the ones that arrived unit untouched), so no rescaling here:
+                # a unit row's dot product with a unit index row is the cosine.
                 scores = self._gpu_vectors @ queries.T
                 if rows is not None:
                     scores = scores.index_select(0, rows)

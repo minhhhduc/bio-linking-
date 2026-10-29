@@ -23,6 +23,9 @@ class Encoder(Protocol):
         An empty input yields ``(0, dim)`` without invoking the model.
         """
 
+    def encode_raw(self, texts: Sequence[str]) -> np.ndarray:
+        """The same rows *before* that normalisation (model output as-is)."""
+
 
 class SentenceTransformerEncoder:
     """Encoder backed by a SentenceTransformer checkpoint."""
@@ -95,21 +98,22 @@ class SentenceTransformerEncoder:
         """Embed a mention from its own token positions inside its context.
 
         Each context is tokenized as written with ``[SEP]`` markers around the
-        mention (``common.query.mention_query``); the in-context part is the
-        mean of the last hidden states between the markers, i.e. of the mention
-        tokens only. Words before and after the mention stay context: they
-        shape it through attention without being averaged into its vector.
+        mention (``common.query.mention_query``); the query is the mean of the
+        last hidden states between the markers, i.e. of the mention tokens only
+        and **nothing else**. Words before and after the mention stay context:
+        they shape it through attention without being averaged into its vector.
 
-        That mean is added to ``encode(mention)`` before normalising.  The index
-        rows are built with ``encode(surface)``, so a contextual mean alone is
-        a different function and leaves the row it should hit; the mention's
-        own surface embedding keeps the exact-surface signal, and the
-        contextual part still moves the ranking.
+        ``Q_0 = mean-pool( mention token states )`` — no ``E(m)`` term is added.
+        The pooled vector is returned raw: the retrieval vector is L2-normalised
+        exactly once, after ``Q_GRF`` is formed
+        (``fusion.interpolate_matrix``), and normalising here would hand the
+        fusion a unit vector and fix its weight against the feedback components
+        at 1:1 regardless of their lengths.
 
         ``spans`` holds the gold ``(start_token, end_token)`` per row; ``None``
         falls back to locating the mention string in the sentence.
 
-        Rows are L2-normalised, like :meth:`encode`.
+        Rows are **not** L2-normalised; see :meth:`encode_raw`.
         """
         mention_list = list(mentions)
         context_list = list(contexts)
@@ -214,22 +218,29 @@ class SentenceTransformerEncoder:
         norms = np.linalg.norm(out, axis=1, keepdims=True)
         if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
             raise ValueError("encoder output contains a zero-norm vector")
-        blended = out / norms + self.encode(mention_list)
-        blended_norms = np.linalg.norm(blended, axis=1, keepdims=True)
-        if not np.all(np.isfinite(blended_norms)) or np.any(blended_norms <= 0.0):
-            raise ValueError("blended query contains a zero-norm vector")
-        return (blended / blended_norms).astype(np.float32, copy=False)
+        # Q_0 = mean-pool(mention token states in its sentence) and nothing else.
+        # Returned raw: the one L2 normalisation of a retrieval vector happens
+        # after Q_GRF is formed, inside the fusion.
+        return out.astype(np.float32, copy=False)
 
-    def encode(self, texts: Sequence[str]) -> np.ndarray:
+    def encode_raw(self, texts: Sequence[str]) -> np.ndarray:
+        """``E(·)`` exactly as the model returns it, no L2 normalisation.
+
+        This is the ``E(m)`` / ``E(F_j)`` of the reference formula: the fusion
+        adds and weights these rows as they are, so scaling one here would
+        silently change its weight (architecture §4.4, reference §5 step 2).
+        """
         if isinstance(texts, str):
-            raise ValueError("encode() expects a sequence of strings, not a string")
+            raise ValueError(
+                "encode_raw() expects a sequence of strings, not a string"
+            )
         items = list(texts)
         if not items:
             return np.zeros((0, self.dim), dtype=np.float32)
 
         for text in items:
             if not isinstance(text, str) or not text.strip():
-                raise ValueError("encode() texts must be non-empty strings")
+                raise ValueError("encode_raw() texts must be non-empty strings")
 
         raw = self._model.encode(
             items,
@@ -262,4 +273,17 @@ class SentenceTransformerEncoder:
                 f"encoder dimension changed from {self._dim} to {dim}"
             )
 
+        return vectors.astype(np.float32, copy=False)
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        """``E(·)`` L2-normalised per row.
+
+        Only the KB index rows and a stand-alone query go through this; the
+        components of ``Q_GRF`` use :meth:`encode_raw`, because the retrieval
+        vector is normalised exactly once, after the fusion sum.
+        """
+        vectors = self.encode_raw(texts)
+        if vectors.shape[0] == 0:
+            return vectors
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         return (vectors / norms).astype(np.float32, copy=False)
