@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# Prompt templates for the GRF pipeline (C5 feedback and C8 re-ranking).
+#
+# Edit this file, not the code.  `GRF.prompts` reads it once at import.
+#
+# Placeholders are filled with `str.format` after the text is read:
+#
+#   Feedback instructions
+#     {s}   the sentence (Request.context)
+#     {m}   the mention  (Request.mention)
+#     {n}   n_syn, only used by `syn`
+#     {KB}  target KB name, only used by `std`
+#
+#   Feedback envelope (around the instruction)
+#     {context} / {mention} / {instruction}
+#
+#   Re-ranker (C8)
+#     {mention} / {context} / {candidates}
+#     (candidate_row is filled per candidate with {index} / {cui} / {name} /
+#      {surface}, then joined by newlines into {candidates})
+#
+# To use a literal brace in a template, write it doubled: {{ or }}.
+#
+# Editing any text here changes the feedback cache namespace (GRF.prompts
+# hashes this file), so the next run regenerates instead of reusing answers the
+# old prompt would not have produced.
+# ---------------------------------------------------------------------------
+
+feedback:
+
+  # The envelope sent to the LLM.  `build_prompt` in feedback.py renders it.
+  envelope: |-
+    Context: {context}
+    Mention: {mention}
+    Instruction: {instruction}
+
+  # Instructions, one per feedback kind (architecture §4 / paper §4).
+  # Every instruction must name the mention once; the envelope supplies it too.
+  instructions:
+
+    def: >-
+      Given the context above, write a single concise sentence that explains
+      precisely what the entity "{m}" means.
+
+    syn: >-
+      Given the context above, list exactly {n} synonyms or alternative
+      phrasings that could replace the entity "{m}" in this sentence.
+      Output them as a numbered list, one term per line, with no explanation.
+
+    std: >-
+      Given the context above, give the standard community-recognized
+      academic name for the entity "{m}", following the naming conventions of
+      {KB}. Output the name only, with no explanation.
+
+rerank:
+
+  # One row of the shortlist, joined by newlines into {candidates}.
+  # {index} is 1-based, {cui}/{name}/{surface} come from the Candidate.
+  candidate_row: "{index}. CUI: {cui} | Name: {name} | Surface: {surface}"
+
+  # One CUI answer from the shortlist.  Literal block: the newlines are part of
+  # the prompt, and {candidates} expands to the rows above, one per line.
+  # Only a CUI is accepted back, never an index.  Keep each line unwrapped —
+  # a newline inside a sentence reaches the model as a broken line.
+  instruction: |-
+    Mention: {mention}
+    Context: {context}
+
+    Candidates:
+    {candidates}
+
+    Instruction: Select the single candidate that best matches the mention in context. Answer with exactly one CUI from the list above. Do not answer with a number, an index, or any extra text.

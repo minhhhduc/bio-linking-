@@ -175,12 +175,17 @@ class Encoder(Protocol):
     def dim(self) -> int: ...
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         """(n, dim) float32, L2-normalised; empty input -> (0, dim)."""
+    def encode_raw(self, texts: Sequence[str]) -> np.ndarray:
+        """The same rows before that normalisation (E(·) as the model emits it)."""
 
 class SentenceTransformerEncoder:
     def __init__(self, model_name: str, *, batch_size: int = 32,
                  device: str | None = None) -> None
     @property dim
-    def encode(self, texts) -> np.ndarray
+    def encode(self, texts) -> np.ndarray       # = encode_raw, then L2-normalise
+    def encode_raw(self, texts) -> np.ndarray   # model output, untouched
+    def encode_mention_in_context(self, mentions, contexts, spans) -> np.ndarray
+        # Q_0 = mean-pool(mention token states in the sentence); raw, not normalised
 
 def build_encoder(config: PipelineConfig) -> SentenceTransformerEncoder
 ```
@@ -188,6 +193,15 @@ def build_encoder(config: PipelineConfig) -> SentenceTransformerEncoder
 Lazy `import sentence_transformers` inside `__init__`; raise `RuntimeError`
 with install guidance if absent. Validate non-empty texts, 2-D output, finite
 values, non-zero norms.
+
+**A retrieval vector is L2-normalised exactly once — after `Q_GRF`.** The
+components of the fusion (`Q_0`, every `Q_F_i`) are raw: `encode_raw` hands back
+`E(·)` and `encode_mention_in_context` hands back the mean-pooled mention tokens,
+both unscaled, and `fusion.interpolate_matrix` divides once, after the weighted
+sum. Normalising a component first would scale it *and* hand it a fixed 1:1
+weight against the others. `encode` (normalised) is for what is compared rather
+than summed: the KB index rows, and a stand-alone query. `VectorIndex` likewise
+leaves rows that arrive unit-length untouched.
 
 ## common/index.py  (C4)
 
@@ -257,6 +271,26 @@ def concept_rank_list(hits) -> dict[str, int]
 that of the maximum-scoring hit. Sort score desc, then `cui` asc.
 `concept_rank_list` is 1-based over the same ordering.
 
+## prompts.yaml + prompts.py  (prompt text is data, not code)
+
+Every prompt the system sends lives in `source/GRF/prompts.yaml` — nothing is
+hard-coded, so a prompt change is a file edit, not a code change.
+
+```python
+PROMPT_FILE = Path(__file__).with_name("prompts.yaml")
+def load(path: Path = PROMPT_FILE) -> dict
+def digest(path: Path = PROMPT_FILE) -> str          # sha256, first 16 hex chars
+def get_prompts(path: Path = PROMPT_FILE) -> dict    # cached load
+```
+
+Keys: `feedback.envelope` (`{context}` `{mention}` `{instruction}`),
+`feedback.instructions.{def,syn,std}` (`{m}`, `{s}`, `{n}`, `{KB}`),
+`rerank.candidate_row` (`{index}` `{cui}` `{name}` `{surface}`),
+`rerank.instruction` (`{mention}` `{context}` `{candidates}`). `load` validates
+every placeholder with `string.Formatter`, so a typo fails at load time instead
+of silently sending a broken prompt. `digest()` is what namespaces the feedback
+cache: editing the YAML invalidates the cached answers.
+
 ## feedback.py  (C5) + llm.py
 
 ```python
@@ -273,16 +307,38 @@ class FeedbackCache(Protocol):
     def set(self, key, texts) -> None: ...
 
 class InMemoryFeedbackCache: ...
+class JsonlFeedbackCache:
+    def __init__(self, path, namespace: str, *, fsync: bool = False): ...
+    def __len__(self) -> int                            # entries in this namespace
 
 class FeedbackGenerator:
     def __init__(self, llm: LLMClient, *, cache=None, max_workers: int = 3): ...
     def generate(self, mention, context, feedback_types, n_syn, target_kb
                  ) -> tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]
+    def generate_batch(self, jobs, target_kb
+                       ) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]
 
 def build_instruction(kind, mention, context, n_syn, target_kb) -> str
 def build_prompt(mention, context, instruction) -> str
 def parse_synonyms(text: str, n: int) -> tuple[str, ...]
 ```
+
+`generate_batch` takes `(mention, context, feedback_types, n_syn)` jobs and
+returns one outcome pair per job, in order. It is the fast path: every prompt of
+the whole batch is collected, the cache answers what it can, and the misses go
+to the client in **one** call (`complete_batch` when the client has it, else a
+thread pool of `max_workers`). `generate` is a one-job wrapper over it. A
+batch-level failure degrades every pending item instead of raising; a per-kind
+failure is still a `FeedbackFailure` on that item alone.
+
+`JsonlFeedbackCache` is the on-disk cache: append-only JSONL, one object per
+line (`ns`, `mention`, `context`, `kind`, `texts`), flushed per write so an
+interrupted run keeps what it paid for. `namespace` is
+`"<model>|<prompt digest>"`; lines written under another namespace are ignored
+on load and left on disk, so switching model or editing `prompts.yaml`
+regenerates instead of silently reusing an answer the new prompt would not have
+given. A malformed trailing line (killed mid-write) is skipped, and the last
+line for a key wins.
 
 `hf_llm.py` is the second `LLMClient` implementation, so `FeedbackGenerator`
 and `LLMReranker` are backend-agnostic:
@@ -293,41 +349,59 @@ DTYPES = ("auto", "float16", "bfloat16", "float32")   # imported by the CLI
 class TransformersChatClient:      # lazy torch/transformers import
     def __init__(self, model_name, *, device="auto", dtype="auto",
                  max_new_tokens=256, temperature=0.0,
-                 trust_remote_code=False, use_chat_template=True): ...
+                 trust_remote_code=False, use_chat_template=True,
+                 batch_size: int = 4): ...
     def complete(self, prompt, *, timeout_s=None) -> str
+    def complete_batch(self, prompts) -> list[str]
     def unload(self) -> None
     @property
     def loaded_device(self) -> str | None
 ```
 
+`complete_batch` decodes `batch_size` prompts per `generate` call: decoding is
+memory-bandwidth bound, so one padded batch uses the GPU far better than a
+sequence of single-row calls, and the per-call overhead is paid once per batch.
+Left padding is required with a decoder-only model — the tokens that continue
+the sequence must sit flush against the right edge — so `padding_side` is
+switched for the tokenisation and restored afterwards, and the answers are
+decoded from `input_length` onwards so padding never reaches the output. An
+individual empty answer comes back as `""` (that item's failure only);
+batch-level failures still raise `LLMError`.
+
 `model_name` is a HuggingFace id or a local directory. Weights load on the
 first `complete()` and stay resident until `unload()`; generation is serialised
-with a lock because feedback calls are concurrent and one resident model serves
-one generation at a time. `temperature=0.0` is greedy, matching the API
-client's default. `device="auto"` resolves to CUDA when the runtime has one;
-`dtype="auto"` is then resolved *from that resolved device* (`bfloat16` on
-CUDA, `float32` on CPU), *not* the checkpoint's own dtype — the device is
-resolved before the weights load, so the default `"auto"`/`"auto"` pair really
-does load bfloat16 on a GPU.
+with a lock because one resident model serves one generation at a time — which
+is exactly why callers prefer `complete_batch` over many concurrent `complete`
+calls, which would only queue on that lock. `temperature=0.0` is greedy,
+matching the API client's default. `device="auto"` resolves to CUDA when the
+runtime has one; `dtype="auto"` is then resolved *from that resolved device*
+(`bfloat16` on CUDA, `float32` on CPU), *not* the checkpoint's own dtype — the
+device is resolved before the weights load, so the default `"auto"`/`"auto"`
+pair really does load bfloat16 on a GPU.
 `timeout_s` is accepted and ignored: a local generation
 cannot be interrupted mid-step without leaving the CUDA context undefined.
 `use_chat_template=False` feeds the raw prompt instead of
-`tokenizer.apply_chat_template`. Setup failures (missing dependency, device the
+`tokenizer.apply_chat_template`. The chat template is rendered with
+`enable_thinking=False` when it accepts that variable (Qwen3-class checkpoints
+reason by default and would spend the whole `max_new_tokens` budget inside a
+` thinking` block), with a fallback for templates that reject the kwarg; any
+`think` block that still appears is stripped from the decoded answer. Setup failures (missing dependency, device the
 runtime does not have, unloadable checkpoint, move-to-device) and generation
 failures (OOM, unsupported dtype) all surface as `LLMError`, so they degrade
 exactly like a failed API call. The class is not a GPU-free operation: a local
 model is a third CUDA resident alongside the encoder and the index's GPU copy,
-which matters on a Colab-sized device.
+which matters on a Colab-sized device — `EntityLinker.feedback_batch` exists so
+a caller can free it before the other two load.
 
-Prompt template exactly:
-`Context: {s}\nMention: {m}\nInstruction: {t}`.
-Instruction texts are copied verbatim from reference_abstract §4. Feedback
-calls run concurrently; cache key = (mention, context, kind, instruction);
-only successful results are cached. Any per-kind exception becomes a
-`FeedbackFailure`; the generator never raises for LLM failures. Unknown kind /
-invalid n_syn raise `ValueError` before calling. The low-level prompt and
-generator APIs accept any positive integer `n_syn`; the reference value set
-`N_SYN_VALUES` is enforced by `PipelineConfig` and `EntityLinker.link()`.
+Prompt template exactly: `feedback.envelope` rendered with the context, the
+mention and the instruction. Instruction texts are English, live in
+`prompts.yaml`, and are a user-editable rendition of reference_abstract §4.
+Cache key = (mention, context, kind, instruction); only successful results are
+cached. Any per-kind exception becomes a `FeedbackFailure`; the generator never
+raises for LLM failures. Unknown kind / invalid n_syn raise `ValueError` before
+calling. The low-level prompt and generator APIs accept any positive integer
+`n_syn`; the reference value set `N_SYN_VALUES` is enforced by `PipelineConfig`
+and `EntityLinker.link()`.
 
 ## rerank.py  (C8)
 
@@ -340,7 +414,16 @@ class Reranker(Protocol):
 class PickTopOne: ...
 class LLMReranker:
     def __init__(self, llm: LLMClient, *, timeout_s: float | None = 30.0): ...
+    def rerank_batch(self, items) -> list[str | Exception]
 ```
+
+`rerank_batch` takes `(mention, context, candidates, concept_names)` items and
+returns one entry per item: the chosen CUI, or the exception that item raised.
+Every prompt is built first, then decoded in one batched call; each answer is
+parsed separately, so one unusable answer degrades that mention only. A
+batch-level failure raises `RerankError` and the caller falls back to the
+per-mention path. `rerank` remains the single-item API, and `_parse_answer` is
+shared by both.
 
 `timeout_s=None` forwards no timeout of its own, which means "use the client's
 policy": the OpenAI client applies its configured default, a local model has
@@ -384,10 +467,14 @@ gold CUI, label, token spans, record/entity indices), retrieval `cui`,
 `load_candidates` validates the sample and candidate fields (the optional
 `score_kind`/`error` values pass through) and reconstructs
 `Response.debug["concept_ranking"]`, so `metrics_from_responses` can compute
-R@1/R@5 without re-running retrieval. `rerank_candidates` applies
-`select_with_fallback` and reports progress; it never loads the encoder or the
-vector index. `save_candidates`/`load_candidates` accept the same
-`progress_callback`; pass `total` when the caller already counted the records.
+R@1/R@5 without re-running retrieval. `rerank_candidates` applies the re-ranker
+and reports progress; it never loads the encoder or the vector index. When the
+re-ranker offers `rerank_batch` (an `LLMReranker`), the whole candidate list is
+turned into prompts, decoded in batches, and the answers are then assigned back
+to their mentions — one invalid answer degrades that mention to Top-1, and a
+batch-level failure falls back to the per-mention `select_with_fallback` path.
+`save_candidates`/`load_candidates` accept the same `progress_callback`; pass
+`total` when the caller already counted the records.
 
 ## pipeline.py + evaluator.py + cli.py
 
@@ -399,9 +486,13 @@ pipeline-running wrappers (`make_requests`, `evaluate`, `evaluate_all`).
 class EntityLinker:
     def __init__(self, index, encoder, config, *,
                  feedback_generator=None, reranker=None,
-                 concept_names: Mapping[str, str] | None = None): ...
+                 concept_names: Mapping[str, str] | None = None,
+                 use_context_query: bool = True): ...
     def link(self, request: Request) -> Response
-    def link_batch(self, requests, *, progress_callback=None) -> list[Response]
+    def feedback_batch(self, requests, *, progress_callback=None
+                       ) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]
+    def link_batch(self, requests, *, feedback_outcomes=None,
+                   progress_callback=None) -> list[Response]
 class Metrics: n, recall_at_1, recall_at_5, accuracy
 def evaluate(linker, samples) -> Metrics
 def evaluate_all(linker, samples, *, progress_callback=None
@@ -410,6 +501,15 @@ def metrics_from_responses(samples, responses
                            ) -> tuple[Metrics, dict[str | None, Metrics]]
 def evaluate_by_label(linker, samples) -> dict[str | None, Metrics]
 ```
+
+`feedback_batch` runs phase 2 alone and returns exactly what `link_batch`
+accepts as `feedback_outcomes`. It exists so a caller can generate every
+mention's feedback, unload the LLM, and only then load the encoder and take the
+index's GPU copy — the feedback phase is the only one that needs no encoder at
+all, and on a large feedback model the two sets of weights do not fit side by
+side. `link_batch(..., feedback_outcomes=...)` replays that list and skips phase
+2, so the `"feedback"` phase is not reported a second time; the list length must
+match the request count.
 
 `link_batch` reports through `progress_callback(phase, done, total)` — a
 different unit per phase, so a caller can draw `PROGRESS_PHASES` as one bar
@@ -434,7 +534,9 @@ or `rerank="llm"` without a reranker, construction raises `ValueError`. When
 `std` instruction; retrieval filtering uses `index_kb` (None = all sources).
 `Response.debug` includes `Q_0`, `Q_F`, weights, feedback texts, failures,
 retrieval hits, the untruncated concept ranking (`concept_ranking`, used by the
-evaluator for R@5), `score_kind`, and rerank mode. `rank_lists` and
+evaluator for R@5), `score_kind`, and rerank mode. The recorded `Q_0` and `Q_F`
+are the **raw** vectors that entered the fusion (not unit-normalised), so a
+check can recompute `Q_GRF` from the debug entry alone. `rank_lists` and
 `rrf_scores` are present only in the RRF pipeline. The CLI records
 `encoder_info` when building an index and rejects a prebuilt index whose
 stored encoder differs from the requested one.

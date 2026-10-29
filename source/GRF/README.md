@@ -13,7 +13,7 @@ results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 | C2 | Homonym rewriting `a + " (" + N_c + ")"` | `common/kb.py` (`surface_entries`) | §3 |
 | C3 | Encoder `E(·)` (BioSyn/SapBERT) | `common/encoder.py` | §3, §5 |
 | C4 | Exact cosine vector index, one entry per surface form; directory (`save`/`load`) or single-file `.npz` (`save_npz`/`load_npz`) persistence | `common/index.py` | §3, §4.2, §5.1 |
-| C5 | Feedback generation (`def`, `syn`, `std`) + cache + fallback | `feedback.py`; clients in `llm.py` (API) and `hf_llm.py` (local transformers) | §4, §6 |
+| C5 | Feedback generation (`def`, `syn`, `std`) + cache + fallback | `feedback.py`; prompt text in `prompts.yaml` (loaded by `prompts.py`); clients in `llm.py` (API) and `hf_llm.py` (local transformers) | §4, §6 |
 | C6 | Vector interpolation / weighted RRF | `fusion.py` | §5, §7 |
 | C7 | Concept aggregation `max` over aliases | `common/aggregation.py` | §7.3 |
 | C8 | Pick Top-1 / LLM re-ranker (no index access) | `rerank.py` | §8 |
@@ -28,13 +28,21 @@ working. The dense baseline notebook uses `common/` only.
 
 ## Method equations implemented
 
-- `Q_0 = E(m)`; `Q_F = E(F)`; for synonyms
-  `Q_F = (1/n) Σ_j E(F_syn,j)` (mean of the encoder outputs, not renormalised
-  before fusion).
+- `Q_0 = E(m)`; with `use_context_query=True` it is **only**
+  `mean-pool(mention token states in its sentence)` (architecture §4.4) — no
+  `E(m)` term is added. It is passed to the fusion **raw**. `Q_F = E(F)`; for
+  synonyms `Q_F = (1/n) Σ_j E(F_syn,j)` (mean of the raw encoder outputs).
+- **A retrieval vector is L2-normalised exactly once, after `Q_GRF`.** The
+  components enter the sum unscaled (`encoder.encode_raw`,
+  `encode_mention_in_context`) and the single division happens after the
+  weighted sum, in `fusion.interpolate_matrix` / `interpolate_vectors`.
+  `encoder.encode` (normalised) only builds the KB index rows and a
+  stand-alone query; `VectorIndex` leaves rows that arrive unit-length
+  untouched, so the fusion's normalisation is never repeated.
 - Vector pipeline:
   `Q_GRF = w_0 Q_0 + Σ_i w_i Q_Fi` with every weight `w = 1/(n+1)`, where `n`
-  is the number of successful feedback components. The fused vector is
-  L2-normalised (cosine ranking is unchanged).
+  is the number of successful feedback components; the sum is then
+  L2-normalised, once.
 - Rank pipeline: `RRF(c) = w_0 / r_0(c) + Σ_i w_i / r_Fi(c)`, with
   `w_i = 1/(n+1)` and `1/r_x(c) = 0` when `c` is absent from list `x`.
   Concept rank lists are built with the same max-over-aliases aggregation.
@@ -216,16 +224,40 @@ data loading, re-ranking) drives a `tqdm` bar through the library's
 With `DEVICE = "cuda"`, `ranking.ipynb` and `baseline/ranking.ipynb` keep one
 GPU copy of the index (`VectorIndex.use_gpu`) and scores queries with a batched
 matrix multiply; only rows at or above each k-th score return to CPU. If the
-copy does not fit, it logs a warning and uses the CPU scan.
+copy does not fit, it logs a warning and uses the CPU scan. In `ranking.ipynb`
+the copy is taken **after** the feedback model is unloaded (see below), so the
+two never share the card.
 
-**GPU residents.** `ranking.ipynb` with a local feedback model holds three
-CUDA residents at once — the SapBERT encoder, the index copy, and the local
-LLM — and the LLM is loaded last, so an out-of-memory load shows up as
-per-kind feedback failures (silent degradation to `Q_0`) rather than a crash.
-On a 16 GB Colab GPU use a small model or `LLM_LOCAL_DEVICE = "cpu"`; a CPU
-feedback model costs VRAM nothing and only slows the feedback stage.
-`reranking.ipynb` holds only the re-ranker's model, but that model is still GPU
-state when `LLM_BACKEND = "local"` and `LLM_LOCAL_DEVICE = "cuda"`.
+**Phases do not pile up.** `ranking.ipynb` runs the pipeline in two passes:
+`EntityLinker.feedback_batch` generates every mention's feedback and draws the
+`feedback` bar; the local model is then unloaded and the CUDA cache emptied;
+only after that is the index's GPU copy taken and `link_batch(...,
+feedback_outcomes=...)` replays the saved feedback through the encoder,
+retrieval and ranking phases. No point in the run holds the LLM weights and the
+index copy at the same time.
+
+Every generated feedback text is appended to `FEEDBACK_CACHE_PATH`
+(`JsonlFeedbackCache`, on Drive next to the candidate file), so an interrupted
+run keeps what it already paid for and a re-run reloads instead of regenerating.
+The cache namespace is `<model>|<prompt digest>`, so switching model or editing
+`prompts.yaml` invalidates the old answers instead of silently reusing them.
+
+Prompt text is data, not code: `source/GRF/prompts.yaml` holds every template
+the feedback generator and the re-ranker send, in English, and `prompts.py`
+loads it, validates each placeholder, and exposes `digest()` for the cache
+namespace. Editing a prompt is editing that file — no Python change, no re-run
+of anything else.
+
+**Batching.** A local model decodes `batch_size` prompts per `generate` call
+(`TransformersChatClient.complete_batch`, `LLM_LOCAL_BATCH_SIZE` in the
+notebooks; 4–8 on an 80 GB GPU). This matters because the client holds a lock
+across each `generate`: many concurrent `complete` calls would only queue, so
+one padded batch is worth far more than eight threads. The re-ranker batches the
+same way through `LLMReranker.rerank_batch`.
+
+**GPU residents.** `reranking.ipynb` holds only the re-ranker's model, but that
+model is still GPU state when `LLM_BACKEND = "local"` and
+`LLM_LOCAL_DEVICE = "cuda"`.
 
 Each notebook ends by dropping its large objects (`gc.collect`) and calling
 `unload()` on a local model; `build_KB`, `ranking` and the baseline's

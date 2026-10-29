@@ -119,7 +119,7 @@ Mỗi mention $m$ luôn đi kèm câu chứa nó $s$ (`Request.context`); không
 
 ```text
 text = s[:start] + " [SEP] " + m + " [SEP] " + s[end:]
-Q    = normalize( E(m) + mean-pool( hidden states của các token nằm giữa hai [SEP] ) )
+Q_0  = mean-pool( hidden states của các token mention nằm giữa hai [SEP] )
 ```
 
 - `start` / `end` là span ký tự của mention trong câu, suy ra từ span token gold
@@ -132,18 +132,27 @@ Q    = normalize( E(m) + mean-pool( hidden states của các token nằm giữa 
   mention được đưa vào phép mean.
 - Truncation câu dài có thể cắt mất mention: encoder báo lỗi thay vì lặng lẽ
   pool nhầm token.
-- Vector được L2-normalize trước khi so cosine với index.
+- $Q_0$ là **duy nhất** phép mean-pool đó: không cộng thêm $E(m)$, không thêm
+  thành phần nào khác.
 
 Phía index KB vẫn encode surface form độc lập ($E(a)$), vì tên khái niệm không
-có ngữ cảnh. Vì vậy $Q$ **cộng thêm $E(m)$** — cùng hàm `encoder.encode` đã dùng
-để dựng row — rồi mới normalize: mean-pool trong ngữ cảnh là một hàm khác, vector
-của nó lệch khỏi đúng row mà nó phải khớp. Baseline và GRF dùng cùng một hàm
+có ngữ cảnh. Baseline và GRF dùng cùng một hàm
 (`SentenceTransformerEncoder.encode_mention_in_context`) cho $Q_0$, nên hai bên
 retrieve trên cùng một biểu diễn và số liệu so sánh được.
 
-Hai notebook `ranking` (baseline và GRF) có công tắc `USE_CONTEXT_QUERY`: `True` dùng công thức
-trên; `False` bỏ ngữ cảnh và lấy $Q = E(m)$ bằng chính `encoder.encode` của thư
-viện — đúng hàm đã dựng index row.
+**Mỗi vector retrieval chỉ được L2-normalize đúng một lần, sau khi $Q_{\text{GRF}}$
+đã hình thành** (§7.2): $Q_0$ là mean-pool **thô**, không chia chuẩn; mỗi
+$Q_{F_i} = \frac{1}{n}\sum_j E(F_j)$ cũng thô; phép chia chuẩn duy nhất nằm ở bước
+nội suy, sau phép cộng có trọng số. Chuẩn hoá $Q_0$ (hay bất kỳ $Q_{F_i}$) trước
+khi cộng sẽ vừa là lần chuẩn hoá thứ hai của cùng vector, vừa gán cho các thành
+phần một trọng số 1:1 cố định — không phải công thức. Khi `feedback_types=()`,
+$Q_{\text{GRF}} = Q_0$ nên phép chuẩn hoá duy nhất đó vẫn nằm ở fusion (baseline:
+ở `VectorIndex.search_batch`, nơi nhận đúng một lần chuẩn hoá cho query thô).
+
+Hai notebook `ranking` (baseline và GRF) có công tắc `USE_CONTEXT_QUERY`: `True` lấy
+$Q_0 = \text{mean-pool}(\text{token mention trong câu})$ như trên; `False` bỏ ngữ
+cảnh và lấy $Q_0 = E(m)$ bằng `encoder.encode_raw` — đúng hàm đã dựng index row,
+trước khi chuẩn hoá.
 
 ## 5. Luồng xử lý
 

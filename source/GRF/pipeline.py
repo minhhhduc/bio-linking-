@@ -4,11 +4,15 @@ Implements architecture §5.2/§5.3 and reference_abstract §5:
 
 * Pipeline 1 (``fusion="vector"``): ``Q_GRF`` is the weighted interpolation of
   ``Q_0`` and the feedback vectors, followed by exactly one index scan.
-* ``Q_0`` was formerly ``E(m)``; it now pools the mention's token states in
-  its sentence and adds ``E(m)``, with the mention kept in place
-  (``common.query.mention_query`` + ``encoder.encode_mention_in_context``), the
-  same query the dense baseline uses.  ``use_context_query=False`` drops the
-  context and uses ``E(m)`` alone, like the dense baseline's switch.
+* ``Q_0`` was formerly ``E(m)``; it now mean-pools the mention's token states
+  in its sentence, with the mention kept in place (``common.query.mention_query``
+  + ``encoder.encode_mention_in_context``), the same query the dense baseline
+  uses.  ``use_context_query=False`` drops the context and uses ``E(m)`` alone,
+  like the dense baseline's switch.
+* Every component of the fusion (``Q_0``, each ``Q_F``) is **raw**: the encoder
+  call that produces it does not L2-normalise.  The retrieval vector is
+  normalised exactly once, after ``Q_GRF`` is formed, inside
+  ``fusion.interpolate_matrix`` (architecture §4.4, §7.2).
 * Pipeline 2 (``fusion="rrf"``): one scan per query, concept-level rank lists,
   then weighted reciprocal rank fusion.
 * ``feedback_types=()`` degrades to plain dense retrieval (architecture §11).
@@ -23,7 +27,6 @@ the weighting explicit (one component per feedback type, all weights
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -105,22 +108,21 @@ class EntityLinker:
         reranker=None,
         concept_names: Mapping[str, str] | None = None,
         use_context_query: bool = True,
-        feedback_workers: int = 8,
     ) -> None:
         if not isinstance(config, PipelineConfig):
             raise TypeError("config must be a PipelineConfig")
         if not isinstance(use_context_query, bool):
             raise TypeError("use_context_query must be a bool")
-        if (
-            isinstance(feedback_workers, bool)
-            or not isinstance(feedback_workers, int)
-            or feedback_workers < 1
-        ):
-            raise ValueError("feedback_workers must be a positive integer")
         if not (hasattr(index, "search") and hasattr(index, "__len__")):
             raise TypeError("index must provide search() and __len__()")
         if not (hasattr(encoder, "encode") and hasattr(encoder, "dim")):
             raise TypeError("encoder must provide encode() and dim")
+        if not hasattr(encoder, "encode_raw"):
+            raise TypeError(
+                "encoder must provide encode_raw(texts): the fusion components "
+                "(Q_0, every Q_F) reach the weighted sum unnormalised, so the "
+                "retrieval vector is L2-normalised exactly once, after Q_GRF"
+            )
         if not hasattr(encoder, "encode_mention_in_context"):
             raise TypeError(
                 "encoder must provide encode_mention_in_context(mentions, "
@@ -132,7 +134,6 @@ class EntityLinker:
         self.config = config
         self._feedback_generator = feedback_generator
         self._use_context_query = use_context_query
-        self._feedback_workers = feedback_workers
 
         if config.index_kb is not None:
             source_kbs = getattr(index, "source_kbs", None)
@@ -187,7 +188,7 @@ class EntityLinker:
         # §5 step 2: one component vector per feedback kind, the mean of its
         # texts (a single text for def/std, the n synonyms for syn).
         component_vectors = [
-            np.mean(self._encode_many(texts), axis=0) for _, texts in specs
+            np.mean(self._encode_raw(texts), axis=0) for _, texts in specs
         ]
         component_labels = [kind for kind, _ in specs]
         w0, feedback_weights = component_weights(len(component_vectors))
@@ -214,10 +215,37 @@ class EntityLinker:
         debug["score_kind"] = retrieval_debug.get("score_kind")
         return self._finish(request, candidates, debug)
 
+    def feedback_batch(
+        self,
+        requests: Sequence[Request],
+        *,
+        progress_callback=None,
+    ) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]:
+        """Phase 2 alone: the feedback text for every request, in order.
+
+        Exists so a caller can run the LLM phase, unload the model, and only
+        then load the encoder — the feedback phase is the only one that needs no
+        encoder at all, and on a large feedback model the two sets of weights
+        do not fit side by side.
+
+        The result can be handed straight to :meth:`link_batch` as
+        ``feedback_outcomes``, which then skips phase 2 instead of regenerating.
+        """
+        if progress_callback is not None and not callable(progress_callback):
+            raise ValueError("progress_callback must be callable or None")
+        items = list(requests)
+        if not items:
+            return []
+        kinds_per_request = [self._validate_request(item) for item in items]
+        return self._run_feedback(
+            items, kinds_per_request, progress_callback
+        )
+
     def link_batch(
         self,
         requests: Sequence[Request],
         *,
+        feedback_outcomes=None,
         progress_callback=None,
     ) -> list[Response]:
         """Link every request in order, one independent pass per phase.
@@ -225,7 +253,7 @@ class EntityLinker:
         Every phase is a batched array operation over the whole request list:
 
         1. ``Q_0``: one encoder call for all mentions (§4.4).
-        2. feedback: one LLM round per mention, mentions run concurrently.
+        2. feedback: one batched LLM call for every prompt (§5).
         3. feedback embeddings: one encoder call for every feedback text.
         4. fusion: ``Q_GRF = W · [Q_0; Q_F]``, a single contraction.
         5. retrieval: one index scan (vector fusion) or ``n_i + 1`` (RRF).
@@ -234,11 +262,10 @@ class EntityLinker:
            With ``rerank="top1"`` this only copies the ranking's first entry
            into ``Response.cui``; no re-ranking runs in the retrieval stage.
 
-        Phase 2 is the only per-mention phase, so it is the only one that
-        parallelises: each mention's round trips occupy a worker and the
-        encoder/index phases stay single batched calls (concurrent encoder
-        calls would only contend for the same device).
-        ``feedback_workers`` bounds that pool.
+        ``feedback_outcomes`` is what :meth:`feedback_batch` returned.  Supplying
+        it skips phase 2, so a caller that already ran the LLM can free its
+        weights before any encoder work starts.  Without it, phase 2 runs here
+        and the ``"feedback"`` phase is reported as usual.
 
         ``progress_callback(phase, done, total)``, when supplied, is called
         by each phase with its own unit, so a caller can draw one bar per
@@ -251,35 +278,27 @@ class EntityLinker:
             return []
         total = len(items)
         kinds_per_request = [self._validate_request(item) for item in items]
-        reports_feedback = any(kinds_per_request)
 
-        # Phase 1 — Q_0 for the whole batch in one encoder call.
-        self._report(progress_callback, "encode Q0", 0, None)
-        q0_matrix = self._encode_q0(items)
-        self._report(progress_callback, "encode Q0", 1, None)
-
-        # Phase 2 — feedback text per mention.  The only per-mention phase, and
-        # the expensive one: every mention's LLM round trips run concurrently
-        # instead of one mention after another.  Results are collected in
-        # request order, so the batch stays deterministic.
-        outcomes: list = [None] * total
-        if not reports_feedback:
-            # Nothing to generate; skip the pool entirely.
-            outcomes = [((), ()) for _ in items]
+        if feedback_outcomes is None:
+            # Phase 1 — Q_0 for the whole batch in one encoder call.
+            self._report(progress_callback, "encode Q0", 0, None)
+            q0_matrix = self._encode_q0(items)
+            self._report(progress_callback, "encode Q0", 1, None)
+            # Phase 2 — feedback text per mention.
+            outcomes = self._run_feedback(
+                items, kinds_per_request, progress_callback
+            )
         else:
-            with ThreadPoolExecutor(max_workers=self._feedback_workers) as pool:
-                futures = {
-                    pool.submit(self._generate_feedback, request, kinds): index
-                    for index, (request, kinds) in enumerate(
-                        zip(items, kinds_per_request)
-                    )
-                }
-                done = 0
-                for future in as_completed(futures):
-                    index = futures[future]
-                    outcomes[index] = future.result()
-                    done += 1
-                    self._report(progress_callback, "feedback", done, total)
+            outcomes = list(feedback_outcomes)
+            if len(outcomes) != total:
+                raise ValueError(
+                    f"feedback_outcomes has {len(outcomes)} entries for "
+                    f"{total} requests"
+                )
+            self._report(progress_callback, "encode Q0", 0, None)
+            q0_matrix = self._encode_q0(items)
+            self._report(progress_callback, "encode Q0", 1, None)
+
         feedbacks = [outcome[0] for outcome in outcomes]
         failures = [outcome[1] for outcome in outcomes]
 
@@ -337,6 +356,26 @@ class EntityLinker:
             )
             self._report(progress_callback, "ranking", done, total)
         return responses
+
+    def _run_feedback(self, items, kinds_per_request, progress_callback) -> list:
+        """Phase 2: feedback text for every request, in request order.
+
+        Every prompt of the batch goes to the client at once, so a local model
+        decodes one padded batch instead of one prompt at a time.
+        """
+        if not any(kinds_per_request):
+            return [((), ()) for _ in items]
+
+        jobs = [
+            (request.mention, request.context, kinds, request.n_syn)
+            for request, kinds in zip(items, kinds_per_request)
+        ]
+        outcomes = self._feedback_generator.generate_batch(
+            jobs, self.config.target_kb
+        )
+        for done, _ in enumerate(outcomes, start=1):
+            self._report(progress_callback, "feedback", done, len(outcomes))
+        return outcomes
 
     @staticmethod
     def _report(progress_callback, phase: str, done: int, total: int | None) -> None:
@@ -431,7 +470,7 @@ class EntityLinker:
         ]
         if not texts:
             return vectors_per_request
-        matrix = self._encode_many(texts)
+        matrix = self._encode_raw(texts)
         grouped = np.add.reduceat(
             matrix, np.asarray(starts, dtype=np.int64), axis=0
         )
@@ -860,7 +899,14 @@ class EntityLinker:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _encode_many(self, texts: Sequence[str]) -> np.ndarray:
+    def _encode_raw(self, texts: Sequence[str]) -> np.ndarray:
+        """``E(·)`` unnormalised: the ``E(F_j)`` that ``Q_F`` is a mean of.
+
+        Deliberately *not* ``encoder.encode``: that L2-normalises every row, and
+        a scaled feedback vector would enter the weighted sum with a different
+        weight than the formula gives it.  The retrieval vector is normalised
+        exactly once, after ``Q_GRF`` (``fusion.interpolate_matrix``).
+        """
         if isinstance(texts, str):
             raise ValueError("texts must be a sequence of strings, not a string")
         items = list(texts)
@@ -868,10 +914,16 @@ class EntityLinker:
             raise ValueError("texts must not be empty")
         for index, text in enumerate(items):
             if not isinstance(text, str) or not text.strip():
-                raise ValueError(
-                    f"texts[{index}] must be a non-empty string"
-                )
-        matrix = np.asarray(self._encoder.encode(items), dtype=np.float64)
+                raise ValueError(f"texts[{index}] must be a non-empty string")
+
+        raw = getattr(self._encoder, "encode_raw", None)
+        if raw is None:
+            raise ValueError(
+                "the encoder must provide encode_raw(texts) so the feedback "
+                "vectors enter the fusion unnormalised; only the KB index rows "
+                "and a stand-alone query use the normalised encode()"
+            )
+        matrix = np.asarray(raw(items), dtype=np.float64)
         if matrix.ndim != 2 or matrix.shape[0] != len(items):
             raise ValueError(
                 "encoder must return an (n, dim) matrix, got "
@@ -882,10 +934,11 @@ class EntityLinker:
         return matrix
 
     def _encode_q0(self, items: Sequence[Request]) -> np.ndarray:
-        """Batched ``Q_0``: the mention in context, or the mention alone.
+        """Batched ``Q_0``, returned raw (never L2-normalised).
 
-        ``use_context_query=False`` encodes ``mention`` on its own through the
-        same ``encoder.encode`` that built the index rows.
+        ``use_context_query=False`` encodes ``mention`` on its own through
+        ``encoder.encode_raw`` — the same function the index rows were built
+        with, before that function's normalisation.
         """
         if not items:
             return np.zeros((0, self._encoder.dim), dtype=np.float64)
@@ -896,7 +949,13 @@ class EntityLinker:
                 [(item.start_token, item.end_token) for item in items],
             )
         else:
-            raw = self._encoder.encode([item.mention for item in items])
+            encode_raw = getattr(self._encoder, "encode_raw", None)
+            if encode_raw is None:
+                raise ValueError(
+                    "use_context_query=False needs encode_raw(mentions) so Q_0 "
+                    "reaches the fusion unnormalised"
+                )
+            raw = encode_raw([item.mention for item in items])
         matrix = np.asarray(raw, dtype=np.float64)
         if matrix.shape != (len(items), self._encoder.dim):
             raise ValueError(

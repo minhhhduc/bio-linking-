@@ -1,4 +1,6 @@
 numpy>=1.24
+# Prompt templates are data (GRF/prompts.yaml), read by GRF/prompts.py.
+pyyaml>=6.0
 # Required only by SentenceTransformerEncoder (BioSyn/SapBERT checkpoints).
 sentence-transformers>=2.7
 # Required only by the CLI's local backend (--llm-backend local) and, in the
