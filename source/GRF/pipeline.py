@@ -34,6 +34,7 @@ import numpy as np
 
 from .aggregation import aggregate_hits, concept_rank_list
 from .config import FEEDBACK_KINDS, N_SYN_VALUES, PipelineConfig
+from .feedback import run_feedback_batch
 from .fusion import (
     component_weights,
     interpolate_matrix,
@@ -61,10 +62,15 @@ _RRF_ROW_BLOCK = 256
 # RRF, which scans once per query component), encoder calls (total=None) for
 # the two encoding phases.
 #
-# The last phase is **ranking**, not re-ranking: this notebook stops at the
-# ranking, and the saved candidate file is re-ranked later by
-# ``reranking.ipynb``.  ``config.rerank == "top1"`` only fills ``Response.cui``
-# with the ranking's first entry, so no re-ranking work runs here.
+# The last phase is **ranking**, not re-ranking: retrieval stops at the
+# ranking, and the saved candidate file is re-ranked later by a separate
+# notebook (``reranking.ipynb``).  ``config.rerank == "top1"`` only fills
+# ``Response.cui`` with the ranking's first entry, so no re-ranking work runs
+# here.
+#
+# ``"feedback"`` only appears when ``link_batch`` runs that phase itself; a
+# caller that supplies ``feedback_outcomes`` -- the two-notebook GRF run, where
+# ``feedback.ipynb`` generated the text and unloaded the model -- skips it.
 PROGRESS_PHASES = (
     "encode Q0",        # §7.1  encode the query (mention + context)
     "feedback",         # C5    generate F_def / F_syn / F_std
@@ -371,17 +377,12 @@ class EntityLinker:
         """
         if not any(kinds_per_request):
             return [((), ()) for _ in items]
-
-        jobs = [
-            (request.mention, request.context, kinds, request.n_syn)
-            for request, kinds in zip(items, kinds_per_request)
-        ]
-        outcomes = self._feedback_generator.generate_batch(
-            jobs, self.config.target_kb
+        return run_feedback_batch(
+            self._feedback_generator,
+            items,
+            self.config.target_kb,
+            progress_callback=progress_callback,
         )
-        for done, _ in enumerate(outcomes, start=1):
-            self._report(progress_callback, "feedback", done, len(outcomes))
-        return outcomes
 
     @staticmethod
     def _report(progress_callback, phase: str, done: int, total: int | None) -> None:

@@ -154,12 +154,15 @@ the stale claims.
 - **Local LLM backend (`hf_llm.py`):** `timeout_s` is accepted and ignored — a
   local generation cannot be interrupted mid-step without leaving the CUDA
   context undefined, so a hung model stalls the feedback stage instead of
-  degrading. In `ranking.ipynb` a local feedback model is a third CUDA
-  resident alongside the SapBERT encoder and the index's GPU copy, so an
-  out-of-memory load degrades to per-kind feedback failures (silent `Q_0`
-  fallback) rather than a crash. On a 16 GB Colab GPU use a small model or
-  `LLM_LOCAL_DEVICE = "cpu"`. `dtype="auto"` is device-aware and deliberately
-  does **not** follow the checkpoint's own (often `float32`) config dtype.
+  degrading. The feedback model is a CUDA resident, so the GRF run is split at
+  that phase: `feedback.ipynb` holds only the LLM, `ranking.ipynb` holds only
+  the SapBERT encoder and the index's GPU copy, and the handoff between them is
+  a file (`grf-feedback-v1`). Inside one notebook the two never coexist. An
+  out-of-memory load still degrades to per-kind feedback failures (silent `Q_0`
+  fallback) rather than a crash, recorded in the bundle. On a 16 GB Colab GPU
+  use a small model or `LLM_LOCAL_DEVICE = "cpu"`. `dtype="auto"` is
+  device-aware and deliberately does **not** follow the checkpoint's own (often
+  `float32`) config dtype.
 - **Outstanding integration/data audit:** the dedicated integration/data
   auditor produced no report. Integration and data correctness beyond the
   checks listed in this record remain unverified by that independent pass.

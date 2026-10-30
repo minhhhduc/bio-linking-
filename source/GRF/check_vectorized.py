@@ -21,6 +21,7 @@ under its own name, so one bar can be drawn per phase.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -466,6 +467,87 @@ def check_batched_feedback() -> None:
     assert "feedback" not in phases, "replayed feedback must not report that phase"
 
 
+def check_feedback_bundle() -> None:
+    """The feedback notebook's file replays into the ranking notebook unchanged.
+
+    The split is only safe if a bundle written after ``run_feedback_batch`` and
+    read back by ``load_feedback_outcomes`` ranks exactly like the one-pass run.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from GRF.feedback import (
+        FEEDBACK_BUNDLE_FORMAT,
+        feedback_namespace,
+        load_feedback_outcomes,
+        run_feedback_batch,
+        save_feedback_outcomes,
+    )
+
+    rng = np.random.default_rng(31)
+    vectors = rng.normal(size=(40, 16)).astype(np.float32)
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    index = VectorIndex(
+        vectors, [f"C{i:03d}" for i in range(40)], [f"S{i}" for i in range(40)]
+    )
+    requests = [
+        Request(mention=f"m{i}", context=f"c{i}", feedback_types=("def", "syn"),
+                n_syn=3)
+        for i in range(4)
+    ]
+    namespace = feedback_namespace("model")
+    assert namespace.startswith("model|"), namespace
+
+    path = Path(tempfile.mkdtemp()) / "feedback.jsonl"
+    generator = _FakeFeedback()
+    outcomes = run_feedback_batch(generator, requests, "KB")
+    save_feedback_outcomes(path, requests, outcomes, namespace=namespace)
+
+    events: list[tuple[int, int | None]] = []
+    reloaded_requests, reloaded_outcomes = load_feedback_outcomes(
+        path, namespace=namespace,
+        progress_callback=lambda done, total: events.append((done, total)),
+    )
+    assert [done for done, _ in events] == [1, 2, 3, 4], events
+    assert [r.mention for r in reloaded_requests] == [r.mention for r in requests]
+    assert [r.feedback_types for r in reloaded_requests] == [()] * 4, (
+        "a loaded request must ask for no feedback: retrieval needs no generator"
+    )
+    assert [
+        [(fb.kind, fb.texts) for fb in feedbacks] for feedbacks, _ in reloaded_outcomes
+    ] == [[(fb.kind, fb.texts) for fb in feedbacks] for feedbacks, _ in outcomes]
+
+    # A bundle from another model/prompt must not be replayed.
+    try:
+        load_feedback_outcomes(path, namespace="other|digest")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a stale namespace must be refused")
+
+    for fusion in ("vector", "rrf"):
+        config = PipelineConfig(fusion=fusion, top_k_retrieval=5, top_k_concept=3)
+        together = EntityLinker(
+            index, _FakeEncoder(), config, feedback_generator=_FakeFeedback()
+        )
+        combined = together.link_batch(requests)
+        # No feedback_generator at all: this is the ranking notebook's linker.
+        split = EntityLinker(index, _FakeEncoder(), config)
+        separate = split.link_batch(
+            reloaded_requests, feedback_outcomes=reloaded_outcomes
+        )
+        assert [r.cui for r in separate] == [r.cui for r in combined], fusion
+        assert [[c.cui for c in r.candidates] for r in separate] == [
+            [c.cui for c in r.candidates] for r in combined
+        ], f"{fusion}: the bundle must rank identically"
+
+    # The file is the documented shape, not an accident of one writer.
+    first = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert first["format"] == FEEDBACK_BUNDLE_FORMAT, first["format"]
+    assert first["ns"] == namespace, first["ns"]
+    assert {"mention", "context", "feedback", "failures"} <= set(first), first
+
+
 def check_batched_rerank() -> None:
     """rerank_candidates decodes all prompts at once and keeps per-mention fallback."""
     from common.data import MentionSample
@@ -612,6 +694,8 @@ def main() -> None:
     print("feedback cache: OK")
     check_batched_feedback()
     print("batched feedback: OK")
+    check_feedback_bundle()
+    print("feedback bundle: OK")
     check_batched_rerank()
     print("batched rerank: OK")
     check_single_normalisation()

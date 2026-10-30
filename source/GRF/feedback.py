@@ -20,8 +20,9 @@ from typing import Protocol, Sequence
 
 from .config import FEEDBACK_KINDS
 from .llm import LLMClient
+from .prompts import digest as prompt_digest
 from .prompts import get_prompts
-from .schemas import Feedback, FeedbackFailure
+from .schemas import Feedback, FeedbackFailure, Request
 
 # Numbered list markers: "1. term" / "2) term".  The trailing whitespace (or
 # end of string) keeps decimal values such as "1.5 mg" intact.
@@ -436,3 +437,186 @@ class FeedbackGenerator:
             for kind in kinds
         ]
         return mention, context, kinds, instructions, n_syn
+
+
+def run_feedback_batch(
+    generator,
+    requests: Sequence,
+    target_kb: str,
+    *,
+    progress_callback=None,
+) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]:
+    """Phase 2 alone for a whole batch: the feedback text of every request.
+
+    Needs no encoder, no index and no KB — it is the LLM-only half of the
+    pipeline, so it can run in a notebook of its own and be handed on as a
+    file: :func:`save_feedback_outcomes` writes the result,
+    ``EntityLinker.link_batch(..., feedback_outcomes=...)`` replays it.  The
+    return value is exactly what ``link_batch`` accepts.
+
+    ``progress_callback(phase, done, total)`` is called with ``"feedback"``
+    once per mention.  A local model decodes the whole batch in one
+    ``generate`` call, so the counts arrive together at the end.
+    """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
+    items = list(requests)
+    if not items:
+        return []
+    jobs = [
+        (item.mention, item.context, item.feedback_types, item.n_syn)
+        for item in items
+    ]
+    outcomes = generator.generate_batch(jobs, target_kb)
+    if progress_callback is not None:
+        for done in range(1, len(outcomes) + 1):
+            progress_callback("feedback", done, len(outcomes))
+    return outcomes
+
+
+FEEDBACK_BUNDLE_FORMAT = "grf-feedback-v1"
+
+
+def save_feedback_outcomes(
+    path,
+    requests: Sequence,
+    outcomes,
+    *,
+    namespace: str,
+    progress_callback=None,
+) -> None:
+    """Write one JSONL record per mention: the request and its feedback.
+
+    This is the handoff between the notebook that runs the LLM and the notebook
+    that runs retrieval, so the retrieval pass never needs the feedback model's
+    weights.  One record per mention, in request order::
+
+        {"format": "grf-feedback-v1", "ns": "<model>|<prompt digest>",
+         "mention": ..., "context": ..., "start_token": ..., "end_token": ...,
+         "feedback": [{"kind": "def", "texts": ["..."]}],
+         "failures": [{"kind": "def", "reason": "..."}]}
+
+    ``namespace`` pins the file to the model and prompt template that produced
+    it; :func:`load_feedback_outcomes` refuses a file from another namespace, so
+    a run can never attribute an old answer to a new prompt.
+    """
+    if not isinstance(namespace, str) or not namespace.strip():
+        raise ValueError("namespace must be a non-empty string")
+    request_list = list(requests)
+    outcome_list = list(outcomes)
+    if len(request_list) != len(outcome_list):
+        raise ValueError(
+            f"got {len(request_list)} requests but {len(outcome_list)} outcomes"
+        )
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as handle:
+        for done, (request, outcome) in enumerate(
+            zip(request_list, outcome_list), start=1
+        ):
+            feedbacks, failures = outcome
+            record = {
+                "format": FEEDBACK_BUNDLE_FORMAT,
+                "ns": namespace,
+                "mention": request.mention,
+                "context": request.context,
+                "start_token": request.start_token,
+                "end_token": request.end_token,
+                "feedback": [
+                    {"kind": feedback.kind, "texts": list(feedback.texts)}
+                    for feedback in feedbacks
+                ],
+                "failures": [
+                    {"kind": failure.kind, "reason": failure.reason}
+                    for failure in failures
+                ],
+            }
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if progress_callback is not None:
+                progress_callback(done, len(request_list))
+
+
+def feedback_namespace(model: str) -> str:
+    """The cache/bundle namespace of one feedback model: ``<model>|<digest>``.
+
+    One function for both notebooks: the bundle written by the feedback
+    notebook and the one the ranking notebook accepts are pinned by the same
+    string, so a mismatch is a message, not a silently replayed old answer.
+    """
+    return f"{_require_text('model', model)}|{prompt_digest()}"
+
+
+def load_feedback_outcomes(path, *, namespace: str | None = None,
+                           progress_callback=None):
+    """Read a file written by :func:`save_feedback_outcomes`.
+
+    Returns ``(requests, outcomes)``: the requests rebuilt from the file (so the
+    retrieval notebook needs neither the gold loader nor the KB), and the
+    ``(feedbacks, failures)`` pairs ``link_batch`` accepts as
+    ``feedback_outcomes``.  A record from another ``namespace`` raises instead
+    of being silently reused.
+
+    ``progress_callback(done, total)`` counts records, like the other loaders.
+    """
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError("progress_callback must be callable or None")
+    source = Path(path)
+    requests: list[Request] = []
+    outcomes: list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]] = []
+    namespaces: set[str] = set()
+
+    with source.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            where = f"{source}:{line_number}"
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{where}: invalid JSON: {exc.msg}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"{where}: record must be an object")
+            if record.get("format") != FEEDBACK_BUNDLE_FORMAT:
+                raise ValueError(
+                    f"{where}: unsupported format {record.get('format')!r}; "
+                    f"expected {FEEDBACK_BUNDLE_FORMAT!r}"
+                )
+            namespaces.add(record.get("ns"))
+
+            feedbacks = []
+            for index, item in enumerate(record.get("feedback") or []):
+                if not isinstance(item, dict):
+                    raise ValueError(f"{where}: feedback[{index}] must be an object")
+                feedbacks.append(
+                    Feedback(kind=item.get("kind"), texts=tuple(item.get("texts") or ()))
+                )
+            failures = []
+            for index, item in enumerate(record.get("failures") or []):
+                if not isinstance(item, dict):
+                    raise ValueError(f"{where}: failures[{index}] must be an object")
+                failures.append(
+                    FeedbackFailure(kind=item.get("kind"), reason=item.get("reason"))
+                )
+
+            requests.append(
+                Request(
+                    mention=record.get("mention"),
+                    context=record.get("context"),
+                    # The feedback is already in this file, so the request asks
+                    # for none: retrieval must not need a generator at all.
+                    feedback_types=(),
+                    start_token=record.get("start_token"),
+                    end_token=record.get("end_token"),
+                )
+            )
+            outcomes.append((tuple(feedbacks), tuple(failures)))
+            if progress_callback is not None:
+                progress_callback(len(requests), None)
+
+    if namespace is not None and namespaces - {namespace}:
+        raise ValueError(
+            f"{source} was written for {sorted(namespaces - {namespace})}, not "
+            f"{namespace!r}; regenerate it with the current model and prompts."
+        )
+    return requests, outcomes

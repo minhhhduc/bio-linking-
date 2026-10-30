@@ -202,15 +202,27 @@ the untruncated concept ranking, so `top_k_concept` no longer caps it; keep
 
 No tests are shipped. The pipeline has never been executed. Colab notebooks live
 in [`source/notebooks/`](../notebooks/): the KB builder is in `common/`, the
-GRF notebooks are in `GRF/`, and the dense baseline is in `baseline/`:
+GRF notebooks are in `GRF/`, and the dense baseline is in `baseline/`.
+
+The GRF run is split at the feedback phase, and the split is a file:
+`feedback.save_feedback_outcomes` writes one JSONL record per mention
+(`def`/`syn`/`std` texts plus the failures that degraded to `Q_0`), pinned to
+`<model>|<prompt digest>`; `load_feedback_outcomes` reads it back as the
+`feedback_outcomes` list `link_batch` accepts.
 
 - `common/build_KB.ipynb` embeds the two-column KB CSV (`CUI,concept`) from
   Google Drive into the single-file artifact. A concept named `NaN` (for
   example C0549184) is the source KB's "none/no" answer and is embedded like
   any other row.
-- `ranking.ipynb` loads the KB data, the artifact and the gold data from
-  Drive, runs candidate retrieval, reports R@1/R@5, and saves every mention's
-  candidates to one JSONL file (`candidates.save_candidates`).
+- `feedback.ipynb` loads the gold data, runs `run_feedback_batch` — phase 2
+  alone, no encoder and no vector index — and writes that bundle. The model's
+  weights are released before the notebook ends, so it holds a 32B LLM and
+  nothing else.
+- `ranking.ipynb` loads the bundle, the KB data, the artifact and the gold
+  data from Drive, runs candidate retrieval over the saved feedback, reports
+  R@1/R@5, and saves every mention's candidates to one JSONL file
+  (`candidates.save_candidates`). It builds no LLM client at all: an
+  `EntityLinker` without a `feedback_generator` replays the bundle.
 - `baseline/ranking.ipynb` encodes each mention and scans the same artifact
   directly (`common.encoder` + `common.index`), with no feedback, fusion or
   LLM. It reports R@1/R@5/accuracy and writes a candidate file in the same
@@ -221,30 +233,29 @@ GRF notebooks are in `GRF/`, and the dense baseline is in `baseline/`:
 
 Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
 data loading, re-ranking) drives a `tqdm` bar through the library's
-`progress_callback`; all four notebooks install `tqdm` explicitly, and
-`ranking`/`reranking` also install `transformers` for the local LLM backend
-(`baseline/ranking` installs neither — it uses no LLM).
+`progress_callback`; all five notebooks install `tqdm` explicitly,
+`feedback` installs `transformers` for the local LLM backend, and `reranking`
+does too (`baseline/ranking` installs neither — it uses no LLM).
 
 With `DEVICE = "cuda"`, `ranking.ipynb` and `baseline/ranking.ipynb` keep one
 GPU copy of the index (`VectorIndex.use_gpu`) and scores queries with a batched
 matrix multiply; only rows at or above each k-th score return to CPU. If the
-copy does not fit, it logs a warning and uses the CPU scan. In `ranking.ipynb`
-the copy is taken **after** the feedback model is unloaded (see below), so the
-two never share the card.
+copy does not fit, it logs a warning and uses the CPU scan.
 
-**Phases do not pile up.** `ranking.ipynb` runs the pipeline in two passes:
-`EntityLinker.feedback_batch` generates every mention's feedback and draws the
-`feedback` bar; the local model is then unloaded and the CUDA cache emptied;
-only after that is the index's GPU copy taken and `link_batch(...,
-feedback_outcomes=...)` replays the saved feedback through the encoder,
-retrieval and ranking phases. No point in the run holds the LLM weights and the
-index copy at the same time.
+**The LLM and the index never share a card.** `feedback.ipynb` generates every
+mention's feedback, unloads the model and empties the CUDA cache; it loads no
+encoder and no index. `ranking.ipynb` then takes the index's GPU copy and runs
+`link_batch(..., feedback_outcomes=...)`, which replays the bundle through the
+encoding, retrieval and ranking phases. No single process ever holds the
+feedback weights and the vector copy at the same time.
 
-Every generated feedback text is appended to `FEEDBACK_CACHE_PATH`
-(`JsonlFeedbackCache`, on Drive next to the candidate file), so an interrupted
-run keeps what it already paid for and a re-run reloads instead of regenerating.
-The cache namespace is `<model>|<prompt digest>`, so switching model or editing
-`prompts.yaml` invalidates the old answers instead of silently reusing them.
+Every generated feedback text is also appended to `FEEDBACK_CACHE_PATH`
+(`JsonlFeedbackCache`, on Drive next to the bundle), so an interrupted
+`feedback.ipynb` run keeps what it already paid for and a re-run reloads
+instead of regenerating. Both the cache and the bundle use the same namespace,
+`<model>|<prompt digest>`, so switching model or editing `prompts.yaml`
+invalidates the old answers instead of silently reusing them — and
+`ranking.ipynb` refuses a bundle written under a different one.
 
 Prompt text is data, not code: `source/GRF/prompts.yaml` holds every template
 the feedback generator and the re-ranker send, in English, and `prompts.py`
@@ -264,6 +275,6 @@ model is still GPU state when `LLM_BACKEND = "local"` and
 `LLM_LOCAL_DEVICE = "cuda"`.
 
 Each notebook ends by dropping its large objects (`gc.collect`) and calling
-`unload()` on a local model; `build_KB`, `ranking` and the baseline's
-`ranking` also empty the CUDA cache (`release_gpu`, `torch.cuda.empty_cache`),
-and `reranking` does the same when a GPU is present.
+`unload()` on a local model; `build_KB`, `feedback`, `ranking` and the
+baseline's `ranking` also empty the CUDA cache (`release_gpu`,
+`torch.cuda.empty_cache`), and `reranking` does the same when a GPU is present.

@@ -321,6 +321,17 @@ class FeedbackGenerator:
 def build_instruction(kind, mention, context, n_syn, target_kb) -> str
 def build_prompt(mention, context, instruction) -> str
 def parse_synonyms(text: str, n: int) -> tuple[str, ...]
+
+FEEDBACK_BUNDLE_FORMAT = "grf-feedback-v1"
+
+def feedback_namespace(model: str) -> str        # "<model>|<prompt digest>"
+def run_feedback_batch(generator, requests, target_kb, *, progress_callback=None
+                       ) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]
+def save_feedback_outcomes(path, requests, outcomes, *, namespace: str,
+                           progress_callback=None) -> None
+def load_feedback_outcomes(path, *, namespace: str | None = None,
+                           progress_callback=None
+                           ) -> tuple[list[Request], list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]]
 ```
 
 `generate_batch` takes `(mention, context, feedback_types, n_syn)` jobs and
@@ -330,6 +341,17 @@ to the client in **one** call (`complete_batch` when the client has it, else a
 thread pool of `max_workers`). `generate` is a one-job wrapper over it. A
 batch-level failure degrades every pending item instead of raising; a per-kind
 failure is still a `FeedbackFailure` on that item alone.
+
+`run_feedback_batch` is that phase on its own for a whole request list, with no
+encoder, index or KB in reach — the LLM half of the GRF run, so it can live in a
+notebook by itself. `save_feedback_outcomes` / `load_feedback_outcomes` are the
+file handoff between the two notebooks: one JSONL record per mention
+(`format`, `ns`, `mention`, `context`, `start_token`, `end_token`,
+`feedback: [{kind, texts}]`, `failures: [{kind, reason}]`), written in request
+order and pinned to `feedback_namespace(model)`. The loader rebuilds the
+requests with `feedback_types=()`, because the feedback is already in the file
+and retrieval must not need a generator; a record from another namespace raises
+instead of being replayed.
 
 `JsonlFeedbackCache` is the on-disk cache: append-only JSONL, one object per
 line (`ns`, `mention`, `context`, `kind`, `texts`), flushed per write so an
@@ -389,9 +411,10 @@ reason by default and would spend the whole `max_new_tokens` budget inside a
 runtime does not have, unloadable checkpoint, move-to-device) and generation
 failures (OOM, unsupported dtype) all surface as `LLMError`, so they degrade
 exactly like a failed API call. The class is not a GPU-free operation: a local
-model is a third CUDA resident alongside the encoder and the index's GPU copy,
-which matters on a Colab-sized device — `EntityLinker.feedback_batch` exists so
-a caller can free it before the other two load.
+model is a CUDA resident, which matters on a Colab-sized device — the GRF run is
+therefore split into two notebooks, and `feedback.run_feedback_batch` (what
+`EntityLinker.feedback_batch` delegates to) exists so the model is freed before
+the encoder and the index's GPU copy load.
 
 Prompt template exactly: `feedback.envelope` rendered with the context, the
 mention and the instruction. Instruction texts are English, live in
@@ -503,13 +526,15 @@ def evaluate_by_label(linker, samples) -> dict[str | None, Metrics]
 ```
 
 `feedback_batch` runs phase 2 alone and returns exactly what `link_batch`
-accepts as `feedback_outcomes`. It exists so a caller can generate every
-mention's feedback, unload the LLM, and only then load the encoder and take the
-index's GPU copy — the feedback phase is the only one that needs no encoder at
-all, and on a large feedback model the two sets of weights do not fit side by
-side. `link_batch(..., feedback_outcomes=...)` replays that list and skips phase
-2, so the `"feedback"` phase is not reported a second time; the list length must
-match the request count.
+accepts as `feedback_outcomes`; it delegates to
+`feedback.run_feedback_batch`, which is the same phase without a linker. The GRF
+notebooks use the split directly: `feedback.ipynb` generates every mention's
+feedback and unloads the LLM, `ranking.ipynb` loads the encoder and the index's
+GPU copy and replays the bundle — the feedback phase is the only one that needs
+no encoder at all, and on a large feedback model the two sets of weights do not
+fit side by side. `link_batch(..., feedback_outcomes=...)` replays that list and
+skips phase 2, so the `"feedback"` phase is not reported a second time; the list
+length must match the request count.
 
 `link_batch` reports through `progress_callback(phase, done, total)` — a
 different unit per phase, so a caller can draw `PROGRESS_PHASES` as one bar
