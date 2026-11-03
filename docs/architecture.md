@@ -240,11 +240,20 @@ Mention: {m}
 Instruction: {t}
 ```
 
-| Loại feedback | Ký hiệu | Tham số | Vai trò kiến trúc |
-| --- | --- | --- | --- |
-| Entity Definition | $F_{\text{def}}$ | — | Bổ sung ngữ nghĩa, giảm lexical gap |
-| N-Synonyms | $F_{\text{syn}}$ | $n \in \{1,3,5,10\}$ | Mở rộng từ vựng; vector là trung bình các synonym |
-| Standard Name | $F_{\text{std}}$ | tên KB đích | Ánh xạ về danh pháp chuẩn |
+| Loại feedback | Ký hiệu | Nguồn | Tham số | Vai trò kiến trúc |
+| --- | --- | --- | --- | --- |
+| Entity Definition | $F_{\text{def}}$ | Shlyk et al. (2024) | — | Bổ sung ngữ nghĩa, giảm lexical gap |
+| N-Synonyms | $F_{\text{syn}}$ | Dobbins (2024) | $n \in \{1,3,5,10\}$ | Mở rộng từ vựng; vector là trung bình các synonym |
+| Standard Name | $F_{\text{std}}$ | Đề xuất của bài báo | tên KB đích | Ánh xạ về danh pháp chuẩn |
+
+Cả ba loại đều sinh **văn bản chữ tự nhiên**; không loại nào trả về CUI hay mã
+khái niệm. $F_{\text{std}}$ chỉ là một chuỗi tên chuẩn, vẫn đi qua encoder như
+mọi feedback khác — nó không phải một phép tra KB.
+
+`feedback_types` nhận từng loại đơn lẻ hoặc cả ba. Bật cả ba là **All-in-One**
+(paper §2.3.3): mỗi loại là một component độc lập, trọng số $1/(n+1)$ với $n=3$,
+tức $1/4$ cho $Q_0$ và mỗi $Q_{F_i}$ — dùng đúng công thức ở §7.2, không có
+đường mã riêng. Đây là cấu hình đạt đỉnh trong phần lớn bảng của bài báo.
 
 Ghi chú triển khai:
 
@@ -387,13 +396,37 @@ Trả về danh sách `(cui, score, surface_rep)` đã sắp xếp; đây là đ
 | Tham số | Giá trị | Ghi chú |
 | --- | --- | --- |
 | `encoder` | `biosyn` \| `sapbert` | ảnh hưởng trực tiếp Bảng 1 vs Bảng 2 |
-| `feedback_types` | `def`, `syn`, `std` | tổ hợp tạo nên "All-in-One" |
+| `feedback_types` | `()`, `("def",)`, `("syn",)`, `("std",)`, hoặc cả ba | `()` = baseline; một phần tử = cấu hình đơn lẻ; cả ba = All-in-One |
 | `n_syn` | 1, 3, 5, 10 | số synonym mỗi lần sinh |
-| `alpha` | $1/(n+1)$ | $n=1 \Rightarrow 0.5$ |
+| `alpha` | $1/(n+1)$ | suy ra từ số component, không phải tham số nhập vào |
 | `top_k_retrieval` | 10 | số surface form lấy ra |
 | `top_k_concept` | 1–10 | số ứng viên đưa vào re-ranker |
 | `fusion` | `vector` \| `rrf` | chọn pipeline 1 hoặc 2 |
 | `rerank` | `top1` \| `llm` | bật/tắt re-ranking |
+
+### 9.1. Ma trận thực nghiệm (theo §3–4 của bài báo)
+
+Mỗi kịch bản dưới đây là **một lần chạy notebook với một dòng cấu hình khác
+nhau**, không phải một nhánh mã:
+
+| Kịch bản | Cấu hình |
+| --- | --- |
+| Baseline, không GRF | `feedback_types=()` (bundle rỗng vẫn hợp lệ) |
+| Single definition | `feedback_types=("def",)` |
+| Single N-synonyms, $n \in \{1,3,5,10\}$ | `feedback_types=("syn",)`, `n_syn=n` |
+| Single standard name | `feedback_types=("std",)`, `target_kb` đặt theo KB |
+| All-in-One ($n_{\text{syn}}=10$) | `feedback_types=("def","syn","std")`, `n_syn=10` |
+| Vector-based / Rank-based | `fusion="vector"` / `fusion="rrf"` |
+| BioSyn / SapBERT | `encoder` và encoder của KB artifact |
+| Độ nhạy mô hình sinh | `LLM_MODEL_LOCAL` (Qwen3 14B/4B/1.7B, Gemma-3 12B/4B/1B) |
+| Re-ranker $k$ | `top_k_concept ∈ {2,3,5,10}`, `rerank="llm"` |
+
+Hai phân tích của bài báo **không** được triển khai ở đây, và không nên báo cáo
+như thể có:
+
+- **Text-based GRF** (paper §2.3.2: nối mention + feedback thành một chuỗi rồi
+  encode). Repo chỉ có vector-based và rank-based.
+- **Quét $\alpha$**: $\alpha = 1/(n+1)$ là cố định, không phải tham số cấu hình.
 
 ## 10. Đo lường
 

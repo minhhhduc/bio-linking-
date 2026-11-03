@@ -53,6 +53,39 @@ Instruction: {t}
 - **Standard Name ($F_{\text{std}}$):**
   Yêu cầu: "Dựa vào ngữ cảnh {s}, hãy tạo ra tên chuẩn học thuật được cộng đồng công nhận (standard community-recognized name) cho thực thể {m}, tuân theo hệ danh pháp của {tên KB đích, ví dụ: NCBI GENE, NCBI TAXONOMY, MeSH}."
 
+**Phân loại feedback trong thực nghiệm của bài báo**
+
+Bài báo đánh giá đúng **3 loại feedback đơn lẻ** (Mục 2.3.1) và **1 cấu hình kết hợp** All-in-One (Mục 2.3.3):
+
+| Loại | Ký hiệu | Nguồn | Sinh ra |
+| --- | --- | --- | --- |
+| Entity definition | $F_{\text{def}}$ | Shlyk et al. (2024) | Một định nghĩa ngữ cảnh của $m$, gói trong một câu |
+| N-synonyms | $F_{\text{syn}}$ | Dobbins (2024) | Danh sách đúng $n$ từ đồng nghĩa hoặc cách diễn đạt tương đương, $n \in \{1,3,5,10\}$ |
+| Standard name | $F_{\text{std}}$ | **Đề xuất của bài báo này** | Tên chuẩn theo hệ danh pháp của KB đích (NCBI Gene, NCBI Taxonomy, MeSH, …) |
+
+Cả ba đều là **văn bản chữ tự nhiên**. Không loại nào sinh ra mã khái niệm/CUI:
+$F_{\text{std}}$ trông giống bước chuẩn hóa nhưng chỉ là một chuỗi tên do LLM
+sinh, sau đó được mã hóa thành vector như mọi feedback khác — nó không phải một
+phép tra cứu KB (Mục 2.3.1).
+
+**All-in-One** (Mục 2.3.3): bật đồng thời cả ba loại. Mỗi loại là một thành phần
+feedback độc lập, trọng số bằng nhau $1/(n+1)$ với $n$ là số loại feedback (công
+thức ở §5). Cấu hình All-in-One trong bài báo dùng 10 synonyms + definition +
+standard name. Đây là cấu hình đạt đỉnh ở phần lớn các bảng kết quả.
+
+**Các dạng feedback trong nghiên cứu trước (Mục 1)**
+
+Mục 1 điểm lại các dạng văn bản feedback mà nghiên cứu BEL trước đây từng cho
+LLM sinh. Đây là **bối cảnh**, không phải cấu hình được đánh giá trong thực
+nghiệm của bài báo:
+
+| Dạng | Nguồn | Quan hệ với 3 loại ở trên |
+| --- | --- | --- |
+| Zero-shot definition generation | Shlyk et al. (2024) | Chính là Entity definition |
+| Alternative phrasing | Dobbins (2024) | Được gộp vào N-synonyms |
+| Mention simplification | Borchert et al. (2024) | Không dùng trong bài này |
+| Acronym resolution | Abdulnazar et al. (2024) | Không dùng trong bài này |
+
 ## 5. Kiến trúc Pipeline
 
 ### Pipeline 1: Vector-based GRF (Gộp trước khi truy xuất - Pre-retrieval)
@@ -196,6 +229,16 @@ $$
 **Bước 3 - Xếp hạng lại:** Sắp xếp toàn bộ ứng viên theo điểm $\text{RRF}(c)$ giảm dần để lấy Top-$k$ ứng viên cho bước re-ranking.
 
 ## 6. Kết quả thực nghiệm
+
+**Các kịch bản được đánh giá**
+
+- **Loại feedback:** 3 cấu hình đơn lẻ ($F_{\text{def}}$, $F_{\text{syn}}$, $F_{\text{std}}$) và All-in-One ($F_{\text{def}} + F_{\text{syn}} + F_{\text{std}}$).
+- **Số synonyms:** $n \in \{1,3,5,10\}$; mỗi giá trị $n$ báo cáo trung bình trên 5 lần sinh độc lập.
+- **Cách tích hợp:** text-based (nối mention + feedback thành một chuỗi rồi encode), vector-based, rank-based (Mục 2.3.2). Kết quả: text-based yếu hơn baseline ở hầu hết bộ dữ liệu (hiệu ứng "asymmetric query"), vector-based mạnh nhất ở R@1, rank-based mạnh hơn ở R@5.
+- **Trọng số $\alpha$:** quét $\alpha \in [0,1]$ để tách đóng góp của mention gốc và feedback; $\alpha = 0.5$ là mặc định.
+- **Mô hình sinh feedback:** GPT-4o, Qwen3 (14B, 4B, 1.7B), Gemma-3 (12B, 4B, 1B).
+- **Encoder:** BioSyn và SapBERT (Bảng 1 và Bảng 2).
+- **Re-ranker:** GPT-4o với $k \in \{2,3,5,10\}$ ứng viên, so với Pick Top-1 (Bảng 3).
 
 ### Bảng 1: Hiệu năng Truy xuất ứng viên trên mô hình BioSyn (Table 3)
 
