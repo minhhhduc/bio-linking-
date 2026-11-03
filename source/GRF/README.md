@@ -265,10 +265,14 @@ of anything else.
 
 **Batching.** A local model decodes `batch_size` prompts per `generate` call
 (`TransformersChatClient.complete_batch`, `LLM_LOCAL_BATCH_SIZE` in the
-notebooks; 4–8 on an 80 GB GPU). This matters because the client holds a lock
+notebooks; 16–32 on an 80 GB GPU). This matters because the client holds a lock
 across each `generate`: many concurrent `complete` calls would only queue, so
-one padded batch is worth far more than eight threads. The re-ranker batches the
-same way through `LLMReranker.rerank_batch`.
+one padded batch is worth far more than eight threads. The 32B checkpoint's
+weights are most of the card; the rest is KV cache, about 0.25 MiB per token of
+prompt+answer per row, so the batch size is limited by free VRAM, not by the
+thread count. A batch that runs out of memory degrades to `Q_0` and is logged
+as failures rather than raised. The re-ranker batches the same way through
+`LLMReranker.rerank_batch`.
 
 **GPU residents.** `reranking.ipynb` holds only the re-ranker's model, but that
 model is still GPU state when `LLM_BACKEND = "local"` and
