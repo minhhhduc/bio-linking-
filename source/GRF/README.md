@@ -219,17 +219,22 @@ The GRF run is split at the feedback phase, and the split is a file:
   weights are released before the notebook ends, so it holds a 32B LLM and
   nothing else.
 - `ranking.ipynb` loads the bundle, the KB data, the artifact and the gold
-  data from Drive, runs candidate retrieval over the saved feedback, reports
-  R@1/R@5, and saves every mention's candidates to one JSONL file
-  (`candidates.save_candidates`). It builds no LLM client at all: an
+  data from Drive, then one run walks every `(feedback subset, fusion)` pair
+  from `FEEDBACK_SCENARIOS` x `FUSIONS`: it runs candidate retrieval over the
+  saved feedback, saves that scenario's candidates to
+  `candidates/grf_<scenario>_n<n>_k<k>_candidates.jsonl`
+  (`candidates.save_candidates`), reports `acc@k`, and writes all scenarios to
+  `grf_retrieval_summary.json`. It builds no LLM client at all: an
   `EntityLinker` without a `feedback_generator` replays the bundle.
 - `baseline/ranking.ipynb` encodes each mention and scans the same artifact
   directly (`common.encoder` + `common.index`), with no feedback, fusion or
   LLM. It reports R@1/R@5/accuracy and writes a candidate file in the same
   format.
-- `reranking.ipynb` reads only that candidate file, applies Top-1 or the LLM
-  re-ranker (`candidates.rerank_candidates`), and reports end-to-end accuracy;
-  it never loads the encoder, the index or the KB artifact.
+- `reranking.ipynb` reads every `candidates/grf_*_candidates.jsonl` file,
+  applies Top-1 or the LLM re-ranker (`candidates.rerank_candidates`) to each,
+  and writes one end-to-end accuracy JSON per scenario to `e2e_results/` plus
+  a combined `grf_e2e_summary.json`; it never loads the encoder, the index or
+  the KB artifact.
 
 Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
 data loading, re-ranking) drives a `tqdm` bar through the library's

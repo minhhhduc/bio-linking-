@@ -70,7 +70,7 @@ Tài liệu này mô tả kiến trúc triển khai (implementation architecture
 | C6 | Fusion | Gộp $Q_0$ với $Q_{F_i}$ (pre) hoặc gộp ranked list (post) | Vector interp., Weighted RRF |
 | C7 | Concept Aggregator | Gộp điểm surface form → điểm concept | `max` trên alias |
 | C8 | Re-ranker | Xếp hạng lại top-k concept | GPT-4o, heuristic top-1 |
-| C9 | Evaluator | Tính R@1, R@5, accuracy end-to-end | Script đánh giá |
+| C9 | Evaluator | Tính acc@k và accuracy end-to-end | Script đánh giá |
 
 ## 4. Dữ liệu và hợp đồng giữa các tầng
 
@@ -406,16 +406,23 @@ Trả về danh sách `(cui, score, surface_rep)` đã sắp xếp; đây là đ
 
 ### 9.1. Ma trận thực nghiệm (theo §3–4 của bài báo)
 
-Mỗi kịch bản retrieval dưới đây là **một lần chạy `ranking.ipynb` với một dòng
-cấu hình khác nhau**, không phải một nhánh mã. `feedback.ipynb` chỉ cần chạy
-**một lần** với `FEEDBACK_TYPES = ("def", "syn", "std")`: bundle chứa đủ ba
-loại, và ranking chọn tập con theo khóa `kind` của từng record. Ngoại lệ là
-`n_syn`: $n$ đã nằm trong câu chỉ thị nên đổi $n$ phải sinh lại `syn` (cache
-theo prompt nên chỉ phần `syn` mới decode).
+**Một lần chạy `ranking.ipynb` đi qua toàn bộ ma trận dưới đây**, không phải
+một nhánh mã: hằng số `FEEDBACK_SCENARIOS` và `FUSIONS` liệt kê các cặp cần
+thử, và Stage 7 tự dựng một `PipelineConfig` cho từng cặp, lưu candidate ra
+`candidates/grf_<scenario>_n<n>_k<k>_candidates.jsonl`, rồi ghi `acc@k` của
+mọi kịch bản vào `grf_retrieval_summary.json`. `reranking.ipynb` đọc mọi file
+candidate đó và ghi một JSON end-to-end cho mỗi kịch bản vào `e2e_results/`.
+
+`feedback.ipynb` cũng chỉ cần chạy **một lần** với
+`FEEDBACK_TYPES = ("def", "syn", "std")`: bundle chứa đủ ba loại, và ranking
+chọn tập con theo khóa `kind` của từng record. Ngoại lệ là `n_syn`: $n$ đã nằm
+trong câu chỉ thị nên đổi $n$ phải sinh lại `syn` (cache theo prompt nên chỉ
+phần `syn` mới decode). Các dòng `encoder` và `LLM_MODEL_LOCAL` bên dưới vẫn
+cần đổi hằng số rồi chạy lại, vì chúng đổi cả KB artifact lẫn bundle.
 
 | Kịch bản | Cấu hình |
 | --- | --- |
-| Baseline, không GRF | `feedback_types=()` (bundle rỗng vẫn hợp lệ) |
+| Baseline, không GRF | `feedback_types=()` (chọn rỗng từ bundle) |
 | Single definition | `feedback_types=("def",)` |
 | Single N-synonyms, $n \in \{1,3,5,10\}$ | `feedback_types=("syn",)`, `n_syn=n` |
 | Single standard name | `feedback_types=("std",)`, `target_kb` đặt theo KB |
@@ -434,10 +441,11 @@ như thể có:
 
 ## 10. Đo lường
 
-- **Candidate retrieval:** R@1, R@5 trên 8 bộ: NCBI Disease, BC5CDR (Disease/Chemical), NLM-Chem, GNormPlus, NLM-Gene, S800, Linnaeus.
-- **End-to-end normalization:** accuracy sau re-ranking (Bảng 3).
-- **Candidate accuracy:** $\text{acc@}k = \frac{1}{n}\sum_i \mathbb{1}[\text{gold}_i \in \text{top-}k\text{ candidates}_i]$
-  trên danh sách candidate cuối (sau re-ranking nếu có).
+- **Candidate retrieval:** $\text{acc@}k = \frac{1}{n}\sum_i \mathbb{1}[\text{gold}_i \in \text{top-}k\text{ candidates}_i]$
+  trên danh sách candidate `ranking.ipynb` lưu ra, với $k \le$ `top_k_concept`.
+  Đây là thang đo duy nhất cho phần retrieval; repo không báo cáo R@k.
+- **End-to-end normalization:** accuracy sau re-ranking (Bảng 3): tỉ lệ mention
+  mà CUI cuối cùng sau re-rank bằng gold CUI.
 - **Đối chứng:** mỗi cấu hình GRF phải chạy cùng seed/model với baseline không GRF để báo cáo "Mức tăng" có ý nghĩa.
 
 ## 11. Điểm mở rộng
