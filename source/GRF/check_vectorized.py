@@ -174,9 +174,9 @@ class _FakeFeedback:
             [(mention, context, feedback_types, n_syn)], target_kb
         )[0]
 
-    def generate_batch(self, jobs, target_kb):
+    def generate_batch(self, jobs, target_kb, *, progress_callback=None):
         outcomes = []
-        for mention, context, feedback_types, n_syn in jobs:
+        for done, (mention, context, feedback_types, n_syn) in enumerate(jobs, start=1):
             feedbacks, failures = [], []
             for kind in feedback_types:
                 if kind == "def" and mention == "boom":
@@ -193,6 +193,8 @@ class _FakeFeedback:
                         Feedback(kind=kind, texts=(f"{kind} of {mention}",))
                     )
             outcomes.append((tuple(feedbacks), tuple(failures)))
+            if progress_callback is not None:
+                progress_callback(done, len(jobs))
         return outcomes
 
 
@@ -410,6 +412,29 @@ def check_batched_feedback() -> None:
     generator.generate_batch(jobs, "KB")
     assert client.sizes == [8], "cached feedback must not call the LLM again"
 
+    # Progress arrives per decoded chunk, not as one jump when the batch ends:
+    # a 32B batch is minutes long, and a bar frozen at zero looks hung.
+    class SizedClient(BatchClient):
+        batch_size = 3
+
+    sized = SizedClient()
+    events: list[tuple[int, int]] = []
+
+    def record(done: int, total: int) -> None:
+        events.append((done, total))
+
+    FeedbackGenerator(sized).generate_batch(jobs, "KB", progress_callback=record)
+    assert sized.sizes == [3, 3, 2], sized.sizes
+    # (0, 8) first, so the bar exists before the first chunk decode finishes.
+    assert events == [(0, 8), (3, 8), (6, 8), (8, 8)], events
+
+    # A fully cached batch still closes the bar exactly once.
+    cached_events: list[tuple[int, int]] = []
+    generator.generate_batch(
+        jobs, "KB", progress_callback=lambda done, total: cached_events.append((done, total))
+    )
+    assert cached_events == [(0, 0)], cached_events
+
     # link_batch with feedback_outcomes must not touch the generator at all.
     rng = np.random.default_rng(11)
     vectors = rng.normal(size=(40, 16)).astype(np.float32)
@@ -420,7 +445,7 @@ def check_batched_feedback() -> None:
     requests = [Request(mention=f"m{i}", context=f"c{i}") for i in range(4)]
 
     class Exploding:
-        def generate_batch(self, jobs, target_kb):
+        def generate_batch(self, jobs, target_kb, *, progress_callback=None):
             raise AssertionError("the LLM phase must be skipped")
 
         def generate(self, *args, **kwargs):

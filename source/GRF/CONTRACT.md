@@ -315,7 +315,7 @@ class FeedbackGenerator:
     def __init__(self, llm: LLMClient, *, cache=None, max_workers: int = 3): ...
     def generate(self, mention, context, feedback_types, n_syn, target_kb
                  ) -> tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]
-    def generate_batch(self, jobs, target_kb
+    def generate_batch(self, jobs, target_kb, *, progress_callback=None
                        ) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]
 
 def build_instruction(kind, mention, context, n_syn, target_kb) -> str
@@ -337,15 +337,22 @@ def load_feedback_outcomes(path, *, namespace: str | None = None,
 `generate_batch` takes `(mention, context, feedback_types, n_syn)` jobs and
 returns one outcome pair per job, in order. It is the fast path: every prompt of
 the whole batch is collected, the cache answers what it can, and the misses go
-to the client in **one** call (`complete_batch` when the client has it, else a
+to the client in batches (`complete_batch` when the client has it, else a
 thread pool of `max_workers`). `generate` is a one-job wrapper over it. A
 batch-level failure degrades every pending item instead of raising; a per-kind
 failure is still a `FeedbackFailure` on that item alone.
 
+`progress_callback(done, total)` counts **prompts** — one per kind per mention
+the cache could not answer. It fires `(0, total)` before the first decode, then
+once per `batch_size` chunk, so a bar opens immediately and moves during a long
+local run instead of showing nothing and then jumping to done. A fully cached
+batch reports `(0, 0)` once.
+
 `run_feedback_batch` is that phase on its own for a whole request list, with no
 encoder, index or KB in reach — the LLM half of the GRF run, so it can live in a
-notebook by itself. `save_feedback_outcomes` / `load_feedback_outcomes` are the
-file handoff between the two notebooks: one JSONL record per mention
+notebook by itself. It forwards `progress_callback` to `generate_batch` under
+the `"feedback"` phase name. `save_feedback_outcomes` / `load_feedback_outcomes`
+are the file handoff between the two notebooks: one JSONL record per mention
 (`format`, `ns`, `mention`, `context`, `start_token`, `end_token`,
 `feedback: [{kind, texts}]`, `failures: [{kind, reason}]`), written in request
 order and pinned to `feedback_namespace(model)`. The loader rebuilds the

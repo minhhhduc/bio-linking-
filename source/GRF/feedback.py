@@ -324,12 +324,21 @@ class FeedbackGenerator:
         self,
         jobs: Sequence[tuple[str, str, Sequence[str], int]],
         target_kb: str,
+        *,
+        progress_callback=None,
     ) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]:
         """One outcome pair per job, in order.
 
         ``jobs`` holds ``(mention, context, feedback_types, n_syn)``.  A job
         whose kinds are empty yields ``((), ())`` without touching the LLM.
+
+        ``progress_callback(done, total)`` counts **prompts** (one per kind per
+        mention that the cache could not answer), reported after each decoded
+        chunk: a local model's batch is minutes long, so reporting only when
+        ``generate_batch`` returns would show a bar frozen at zero.
         """
+        if progress_callback is not None and not callable(progress_callback):
+            raise ValueError("progress_callback must be callable or None")
         target_kb = _require_text("target_kb", target_kb)
         prepared = [
             self._prepare(mention, context, kinds, n_syn, target_kb)
@@ -344,13 +353,29 @@ class FeedbackGenerator:
                     pending.append((index, mention, context, kind, instruction, n_syn))
 
         answers: dict[tuple[int, str], str | Exception] = {}
+        reported = 0
         if pending:
             prompts = [
                 build_prompt(mention, context, instruction)
                 for _, mention, context, _, instruction, _ in pending
             ]
+            total = len(prompts)
+            if progress_callback is not None:
+                # Open the bar before the first decode, not after it: one 32B
+                # chunk is minutes, and an absent bar reads as a hung notebook.
+                progress_callback(0, total)
+
+            def on_chunk(done: int) -> None:
+                nonlocal reported
+                reported = done
+                progress_callback(done, total)
+
             try:
-                raw_answers: list = list(self._complete_all(prompts))
+                raw_answers: list = list(
+                    self._complete_all(
+                        prompts, None if progress_callback is None else on_chunk
+                    )
+                )
             except Exception as exc:
                 # A batch that failed as a whole (OOM, unloaded model) must not
                 # sink the request: every pending item degrades, as a per-call
@@ -358,6 +383,11 @@ class FeedbackGenerator:
                 raw_answers = [exc] * len(pending)
             for (index, _, _, kind, _, _), raw in zip(pending, raw_answers):
                 answers[(index, kind)] = raw
+        if progress_callback is not None and (
+            not pending or reported != len(pending)
+        ):
+            # Everything cached, or the batch raised: close the bar.
+            progress_callback(len(pending), len(pending))
 
         outcomes = []
         for index, (mention, context, kinds, instructions, n_syn) in enumerate(prepared):
@@ -394,21 +424,33 @@ class FeedbackGenerator:
             outcomes.append((tuple(feedbacks), tuple(failures)))
         return outcomes
 
-    def _complete_all(self, prompts: Sequence[str]) -> list[str]:
+    def _complete_all(self, prompts: Sequence[str], on_progress=None) -> list[str]:
         """Answer every prompt, batched when the client supports it.
 
-        A local model holds a lock across each ``generate``, so many concurrent
-        ``complete`` calls would only queue — one ``complete_batch`` is strictly
-        better.  A networked client has no such limit, so it keeps the thread
-        pool.
+        ``on_progress(done)`` fires once per decoded chunk, so a long local run
+        reports movement instead of one jump at the end.  The chunk size is the
+        client's own ``batch_size``: the same grouping ``complete_batch`` would
+        use internally, hoisted so each chunk can be counted.
         """
         batch = getattr(self._llm, "complete_batch", None)
         if batch is not None:
-            return list(batch(prompts))
+            size = getattr(self._llm, "batch_size", None)
+            if on_progress is None or not isinstance(size, int) or size < 1:
+                return list(batch(prompts))
+            answers: list[str] = []
+            for start in range(0, len(prompts), size):
+                answers.extend(batch(prompts[start : start + size]))
+                on_progress(len(answers))
+            return answers
         # ponytail: threads for HTTP clients only; a local model takes the
         # complete_batch branch above.
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            return list(pool.map(self._llm.complete, prompts))
+            answers = []
+            for answer in pool.map(self._llm.complete, prompts):
+                answers.append(answer)
+                if on_progress is not None:
+                    on_progress(len(answers))
+            return answers
 
     @staticmethod
     def _prepare(mention, context, feedback_types, n_syn, target_kb):
@@ -455,8 +497,8 @@ def run_feedback_batch(
     return value is exactly what ``link_batch`` accepts.
 
     ``progress_callback(phase, done, total)`` is called with ``"feedback"``
-    once per mention.  A local model decodes the whole batch in one
-    ``generate`` call, so the counts arrive together at the end.
+    after each decoded chunk of prompts, so the bar moves during generation
+    rather than jumping to done once ``generate_batch`` returns.
     """
     if progress_callback is not None and not callable(progress_callback):
         raise ValueError("progress_callback must be callable or None")
@@ -467,11 +509,12 @@ def run_feedback_batch(
         (item.mention, item.context, item.feedback_types, item.n_syn)
         for item in items
     ]
-    outcomes = generator.generate_batch(jobs, target_kb)
-    if progress_callback is not None:
-        for done in range(1, len(outcomes) + 1):
-            progress_callback("feedback", done, len(outcomes))
-    return outcomes
+    forward = (
+        None
+        if progress_callback is None
+        else lambda done, total: progress_callback("feedback", done, total)
+    )
+    return generator.generate_batch(jobs, target_kb, progress_callback=forward)
 
 
 FEEDBACK_BUNDLE_FORMAT = "grf-feedback-v1"
