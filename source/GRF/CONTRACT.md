@@ -332,6 +332,8 @@ def save_feedback_outcomes(path, requests, outcomes, *, namespace: str,
 def load_feedback_outcomes(path, *, namespace: str | None = None,
                            progress_callback=None
                            ) -> tuple[list[Request], list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]]
+def select_feedback_kinds(outcomes, kinds
+                          ) -> list[tuple[tuple[Feedback, ...], tuple[FeedbackFailure, ...]]]
 ```
 
 `generate_batch` takes `(mention, context, feedback_types, n_syn)` jobs and
@@ -359,6 +361,13 @@ order and pinned to `feedback_namespace(model)`. The loader rebuilds the
 requests with `feedback_types=()`, because the feedback is already in the file
 and retrieval must not need a generator; a record from another namespace raises
 instead of being replayed.
+
+A bundle may hold every kind at once (the feedback notebook's default).
+`select_feedback_kinds` then keeps only the kinds a retrieval run asks for, so
+the single-type and All-in-One scenarios replay the same file instead of each
+needing its own feedback pass. A requested kind that is absent from both
+`feedback` and `failures` raises — a silently smaller fusion would compare the
+wrong configuration.
 
 `JsonlFeedbackCache` is the on-disk cache: append-only JSONL, one object per
 line (`ns`, `mention`, `context`, `kind`, `texts`), flushed per write so an

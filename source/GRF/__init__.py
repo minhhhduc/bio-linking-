@@ -42,6 +42,7 @@ from .feedback import (
     parse_synonyms,
     run_feedback_batch,
     save_feedback_outcomes,
+    select_feedback_kinds,
 )
 from .fusion import component_weights, interpolate_vectors, rrf_scores
 from .hf_llm import TransformersChatClient
@@ -126,6 +127,7 @@ __all__ = [
     "run_feedback_batch",
     "save_candidates",
     "save_feedback_outcomes",
+    "select_feedback_kinds",
     "select_with_fallback",
     "SentenceTransformerEncoder",
     "surface_entries",

@@ -406,8 +406,12 @@ Trả về danh sách `(cui, score, surface_rep)` đã sắp xếp; đây là đ
 
 ### 9.1. Ma trận thực nghiệm (theo §3–4 của bài báo)
 
-Mỗi kịch bản dưới đây là **một lần chạy notebook với một dòng cấu hình khác
-nhau**, không phải một nhánh mã:
+Mỗi kịch bản retrieval dưới đây là **một lần chạy `ranking.ipynb` với một dòng
+cấu hình khác nhau**, không phải một nhánh mã. `feedback.ipynb` chỉ cần chạy
+**một lần** với `FEEDBACK_TYPES = ("def", "syn", "std")`: bundle chứa đủ ba
+loại, và ranking chọn tập con theo khóa `kind` của từng record. Ngoại lệ là
+`n_syn`: $n$ đã nằm trong câu chỉ thị nên đổi $n$ phải sinh lại `syn` (cache
+theo prompt nên chỉ phần `syn` mới decode).
 
 | Kịch bản | Cấu hình |
 | --- | --- |

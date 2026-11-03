@@ -663,3 +663,38 @@ def load_feedback_outcomes(path, *, namespace: str | None = None,
             f"{namespace!r}; regenerate it with the current model and prompts."
         )
     return requests, outcomes
+
+
+def select_feedback_kinds(outcomes, kinds):
+    """Keep only the requested ``kinds`` in each ``(feedbacks, failures)`` row.
+
+    One bundle can hold every feedback kind, so a retrieval run picks its
+    components by the record's ``kind`` key instead of needing its own bundle
+    per configuration.  A wanted kind that is missing from both lists raises,
+    naming the first mention that lacks it: silently fusing fewer components
+    would compare a single-type run against an All-in-One one.
+    """
+    wanted = tuple(dict.fromkeys(kinds))
+    unknown = [kind for kind in wanted if kind not in FEEDBACK_KINDS]
+    if unknown:
+        raise ValueError(
+            f"unknown feedback kind(s) {unknown}; expected one of {FEEDBACK_KINDS}"
+        )
+    selected = []
+    for index, (feedbacks, failures) in enumerate(outcomes):
+        present = {feedback.kind for feedback in feedbacks} | {
+            failure.kind for failure in failures
+        }
+        missing = [kind for kind in wanted if kind not in present]
+        if missing:
+            raise ValueError(
+                f"outcome {index} has no {missing} feedback (has {sorted(present)}); "
+                "regenerate the bundle with feedback.ipynb"
+            )
+        selected.append(
+            (
+                tuple(f for f in feedbacks if f.kind in wanted),
+                tuple(f for f in failures if f.kind in wanted),
+            )
+        )
+    return selected

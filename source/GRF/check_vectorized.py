@@ -507,6 +507,7 @@ def check_feedback_bundle() -> None:
         load_feedback_outcomes,
         run_feedback_batch,
         save_feedback_outcomes,
+        select_feedback_kinds,
     )
 
     rng = np.random.default_rng(31)
@@ -541,6 +542,38 @@ def check_feedback_bundle() -> None:
     assert [
         [(fb.kind, fb.texts) for fb in feedbacks] for feedbacks, _ in reloaded_outcomes
     ] == [[(fb.kind, fb.texts) for fb in feedbacks] for feedbacks, _ in outcomes]
+
+    # One all-kind bundle serves each configuration: the run selects its subset
+    # by the record's `kind` key. A kind the bundle never produced is an error,
+    # not a silent fallback to fewer components.
+    only_def = select_feedback_kinds(reloaded_outcomes, ("def",))
+    assert [[fb.kind for fb in fbs] for fbs, _ in only_def] == [["def"]] * 4
+    for bad in (("std",), ("bogus",)):
+        try:
+            select_feedback_kinds(reloaded_outcomes, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} must be refused")
+
+    # Selecting `def` from the all-kind bundle ranks exactly like a one-pass
+    # def-only run, which is what makes the subset selection safe.
+    def_config = PipelineConfig(
+        feedback_types=("def",), fusion="vector", top_k_retrieval=5, top_k_concept=3
+    )
+    def_requests = [
+        Request(mention=f"m{i}", context=f"c{i}", feedback_types=("def",), n_syn=3)
+        for i in range(4)
+    ]
+    one_pass = EntityLinker(
+        index, _FakeEncoder(), def_config, feedback_generator=_FakeFeedback()
+    ).link_batch(def_requests)
+    replay = EntityLinker(index, _FakeEncoder(), def_config).link_batch(
+        reloaded_requests, feedback_outcomes=only_def
+    )
+    assert [r.cui for r in replay] == [r.cui for r in one_pass], (
+        "selecting one kind must replay like a single-kind run"
+    )
 
     # A bundle from another model/prompt must not be replayed.
     try:
