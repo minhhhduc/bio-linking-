@@ -656,6 +656,9 @@ def check_batched_rerank() -> None:
     assert [r.cui for r in reranked] == ["C002", "C001", "C001"], [r.cui for r in reranked]
     assert reranked[1].debug["rerank"]["error"], "the failed item must record a reason"
     assert reranked[0].debug["rerank"]["error"] is None
+    # The re-ranked list puts the choice first; the fallback keeps Top-1.
+    assert [c.cui for c in reranked[0].candidates] == ["C002", "C001"], reranked[0].candidates
+    assert [c.cui for c in reranked[1].candidates] == ["C001", "C002"], reranked[1].candidates
 
     # More than one chunk: progress is reported while the batch is decoding,
     # not once after the whole scenario.

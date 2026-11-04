@@ -507,7 +507,10 @@ gold CUI, label, token spans, record/entity indices), retrieval `cui`,
 `score_kind`/`error` values pass through) and reconstructs
 `Response.debug["concept_ranking"]`, so `metrics_from_responses` can compute
 R@1/R@5 without re-running retrieval. `rerank_candidates` applies the re-ranker
-and reports progress; it never loads the encoder or the vector index. When the
+and reports progress; it never loads the encoder or the vector index. The
+returned `Response.candidates` is the re-ranked list: the chosen CUI first,
+the remaining candidates in retrieval order, so `accuracy_at_k` measures the
+re-ranker's choice rather than the original order. When the
 re-ranker offers `rerank_batch` (an `LLMReranker`), the whole candidate list is
 turned into prompts, decoded in batches, and the answers are then assigned back
 to their mentions — one invalid answer degrades that mention to Top-1, and a

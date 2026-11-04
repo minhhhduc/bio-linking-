@@ -232,9 +232,10 @@ The GRF run is split at the feedback phase, and the split is a file:
   format.
 - `reranking.ipynb` reads every `candidates/grf_*_candidates.jsonl` file,
   applies Top-1 or the LLM re-ranker (`candidates.rerank_candidates`) to each,
-  and writes one end-to-end accuracy JSON per scenario to `e2e_results/` plus
-  a combined `grf_e2e_summary.json`; it never loads the encoder, the index or
-  the KB artifact.
+  and writes one `acc@k` JSON per scenario to `e2e_results/` plus a combined
+  `grf_e2e_summary.json`. `rerank_candidates` puts the chosen CUI first, so
+  `acc@1` is the end-to-end accuracy; the notebook never loads the encoder,
+  the index or the KB artifact.
 
 Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
 data loading, re-ranking) drives a `tqdm` bar through the library's

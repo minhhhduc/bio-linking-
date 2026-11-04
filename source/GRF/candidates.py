@@ -99,6 +99,14 @@ def rerank_candidates(
                     for index, outcome in zip(todo, outcomes):
                         batched[index] = outcome
 
+    def placed(response: Response, chosen: str, debug: dict) -> Response:
+        """The re-ranked list: the choice first, the rest in retrieval order."""
+        if chosen not in {candidate.cui for candidate in response.candidates}:
+            return Response(cui=chosen, candidates=response.candidates, debug=debug)
+        first = tuple(c for c in response.candidates if c.cui == chosen)
+        rest = tuple(c for c in response.candidates if c.cui != chosen)
+        return Response(cui=chosen, candidates=first + rest, debug=debug)
+
     reranked: list[Response] = []
     for done, (sample, response) in enumerate(
         zip(sample_list, response_list), start=1
@@ -123,9 +131,7 @@ def rerank_candidates(
                 )
                 cui, error = response.candidates[0].cui, reason
             debug["rerank"] = {"error": error}
-            reranked.append(
-                Response(cui=cui, candidates=response.candidates, debug=debug)
-            )
+            reranked.append(placed(response, cui, debug))
         else:
             cui, error = select_with_fallback(
                 reranker,
@@ -135,9 +141,7 @@ def rerank_candidates(
                 names,
             )
             debug["rerank"] = {"error": error}
-            reranked.append(
-                Response(cui=cui, candidates=response.candidates, debug=debug)
-            )
+            reranked.append(placed(response, cui, debug))
         if progress_callback is not None and batched is None:
             progress_callback(done, len(sample_list))
     if (
