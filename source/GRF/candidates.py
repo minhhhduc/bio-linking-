@@ -29,8 +29,8 @@ def rerank_candidates(
 ) -> list[Response]:
     """Re-rank saved candidates; LLM failures fall back to Top-1.
 
-    ``progress_callback(done, total)`` is called after each sample for the
-    Colab progress bar.
+    ``progress_callback(done, total)`` is called after each sample, or after
+    each 32-item chunk of the batched path, for the Colab progress bar.
 
     A re-ranker that offers ``rerank_batch`` is driven through it: every
     mention's prompt is decoded in one batched call instead of one call per
@@ -62,20 +62,30 @@ def rerank_candidates(
             if response.candidates
         ]
         if todo:
+            # ``rerank_batch`` returns only after the whole scenario is decoded,
+            # so call it in chunks and report each one: the bar moves while the
+            # LLM runs. 32 is a progress granularity, not a throughput knob —
+            # the client still decodes its own batch size per generate call.
+            chunk_size = 32
             try:
-                outcomes = list(
-                    batch(
-                        [
-                            (
-                                sample_list[index].mention,
-                                sample_list[index].context,
-                                response_list[index].candidates,
-                                names,
-                            )
-                            for index in todo
-                        ]
+                outcomes: list[str | Exception] = []
+                for start in range(0, len(todo), chunk_size):
+                    chunk = todo[start : start + chunk_size]
+                    outcomes.extend(
+                        batch(
+                            [
+                                (
+                                    sample_list[index].mention,
+                                    sample_list[index].context,
+                                    response_list[index].candidates,
+                                    names,
+                                )
+                                for index in chunk
+                            ]
+                        )
                     )
-                )
+                    if progress_callback is not None:
+                        progress_callback(len(outcomes), len(sample_list))
             except Exception:
                 # One unusable prompt (or a batch-level failure) must not cost
                 # the whole run: fall back to the per-mention path below,
@@ -128,6 +138,13 @@ def rerank_candidates(
             reranked.append(
                 Response(cui=cui, candidates=response.candidates, debug=debug)
             )
-        if progress_callback is not None:
+        if progress_callback is not None and batched is None:
             progress_callback(done, len(sample_list))
+    if (
+        progress_callback is not None
+        and batched is not None
+        and len(todo) != len(sample_list)
+    ):
+        # Mentions without candidates never entered the batched call.
+        progress_callback(len(sample_list), len(sample_list))
     return reranked

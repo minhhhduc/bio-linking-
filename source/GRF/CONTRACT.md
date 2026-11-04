@@ -513,7 +513,10 @@ turned into prompts, decoded in batches, and the answers are then assigned back
 to their mentions — one invalid answer degrades that mention to Top-1, and a
 batch-level failure falls back to the per-mention `select_with_fallback` path.
 `save_candidates`/`load_candidates` accept the same `progress_callback`; pass
-`total` when the caller already counted the records.
+`total` when the caller already counted the records. `rerank_candidates` calls
+`rerank_batch` in chunks of 32 items so `progress_callback` advances while the
+LLM decodes, and only calls it once per mention when falling back to the
+per-mention path.
 
 ## pipeline.py + evaluator.py + cli.py
 

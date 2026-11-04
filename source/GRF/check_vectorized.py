@@ -657,6 +657,23 @@ def check_batched_rerank() -> None:
     assert reranked[1].debug["rerank"]["error"], "the failed item must record a reason"
     assert reranked[0].debug["rerank"]["error"] is None
 
+    # More than one chunk: progress is reported while the batch is decoding,
+    # not once after the whole scenario.
+    chunked = BatchClient(["C001"] * 40)
+    many = [sample(i) for i in range(40)]
+    many_responses = [
+        Response(cui="C001", candidates=candidates, debug={}) for _ in many
+    ]
+    seen: list[tuple[int, int]] = []
+    rerank_candidates(
+        many,
+        many_responses,
+        reranker=LLMReranker(chunked, timeout_s=None),
+        progress_callback=lambda done, total: seen.append((done, total)),
+    )
+    assert chunked.sizes == [32, 8], chunked.sizes
+    assert seen == [(32, 40), (40, 40)], seen
+
     # A batch-level failure falls back to the per-mention path, which degrades
     # each mention instead of losing the run.
     class Exploding(BatchClient):
