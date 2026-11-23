@@ -333,6 +333,11 @@ class VectorIndex:
             raise RuntimeError(
                 "device='cuda' but CuPy sees no CUDA device; use the CPU path"
             ) from exc
+        if self._npy_path is None and not isinstance(self.vectors, np.ndarray):
+            raise RuntimeError(
+                "device='cuda' needs the raw rows; load the index from an "
+                "artifact so it has a .npy memmap to stream"
+            )
         cp.get_default_memory_pool().free_all_blocks()
         self._device = device
         self._gpu_backend = "cupy"
@@ -466,10 +471,8 @@ class VectorIndex:
 
         if self._npy_path is not None:
             source = np.load(self._npy_path, mmap_mode="r")
-        elif isinstance(self.vectors, np.ndarray):
-            source = self.vectors
         else:
-            source = pc.to_numpy(self.vectors, allow_huge=True)
+            source = self.vectors
         n_rows = int(source.shape[0])
         dim = int(source.shape[1])
         n_queries = int(matrix.shape[0])
