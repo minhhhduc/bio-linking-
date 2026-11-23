@@ -142,6 +142,44 @@ def _preload_cuda_libraries() -> None:
                     pass
 
 
+def _free_ram_bytes() -> int:
+    """Free physical memory in bytes, or 0 when the platform hides it."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        pass
+    try:
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong),
+                ("memory_load", ctypes.c_ulong),
+                ("total_phys", ctypes.c_ulonglong),
+                ("avail_phys", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong),
+                ("avail_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong),
+                ("avail_virtual", ctypes.c_ulonglong),
+                ("avail_extended_virtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatus()
+        status.length = ctypes.sizeof(_MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.avail_phys)
+    except Exception:  # noqa: BLE001 - not Windows, or no ctypes
+        pass
+    return 0
+
+
 class VectorIndex:
     """One entry per KB surface form; exact cosine scan at query time."""
 
@@ -451,6 +489,11 @@ class VectorIndex:
             if rows.size == 0:
                 return empty
             return self._assemble(rows, cols, values, columns, matrix.shape[0])
+        if self._npy_path is not None:
+            rows, cols, values = self._numpy_candidates(matrix, columns, positions)
+            if rows.size == 0:
+                return empty
+            return self._assemble(rows, cols, values, columns, matrix.shape[0])
         chunk_rows = max(
             1, min(self._QUERY_CHUNK, self._SCORE_BUDGET // count)
         )
@@ -488,6 +531,61 @@ class VectorIndex:
                 )
             )
         return results
+
+    def _numpy_candidates(
+        self,
+        matrix: np.ndarray,
+        columns: int,
+        positions: np.ndarray,
+    ):
+        """CPU scan over index row blocks read from the ``.npy`` memmap.
+
+        pycauset's matmul on a file-backed operand goes through its
+        per-element Python streaming route, which is orders of magnitude
+        slower than one BLAS call per block.  Reading the blocks here keeps
+        the KB on disk and the arithmetic in BLAS.
+        """
+        source = np.load(self._npy_path, mmap_mode="r")
+        n_rows = int(source.shape[0])
+        dim = int(source.shape[1])
+        n_queries = int(matrix.shape[0])
+        itemsize = np.dtype(np.float32).itemsize
+        mask_itemsize = np.dtype(np.bool_).itemsize
+        per_row = dim * itemsize + n_queries * (itemsize + mask_itemsize)
+        free = _free_ram_bytes()
+        block_rows = max(1, free // 3 // per_row) if free > 0 else n_rows
+        filtered = int(positions.size) != n_rows
+
+        queries = np.ascontiguousarray(matrix, dtype=np.float32)
+        rows_out: list[np.ndarray] = []
+        cols_out: list[np.ndarray] = []
+        values_out: list[np.ndarray] = []
+        for start in range(0, n_rows, block_rows):
+            stop = min(n_rows, start + block_rows)
+            lo = int(np.searchsorted(positions, start, side="left"))
+            hi = int(np.searchsorted(positions, stop, side="left"))
+            if hi <= lo:
+                continue
+            block = source[start:stop]
+            if filtered:
+                block = block[positions[lo:hi] - start]
+            scores = queries @ block.T
+            width = hi - lo
+            kth = min(columns, width)
+            # np.partition copies, so the block keeps its column order.
+            cutoff = np.partition(scores, width - kth, axis=1)[:, width - kth]
+            rows, cols = np.nonzero(scores >= cutoff[:, None])
+            rows_out.append(rows)
+            cols_out.append(positions[lo:hi][cols])
+            values_out.append(scores[rows, cols])
+        if not rows_out:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty.copy(), np.empty(0, dtype=np.float32)
+        return (
+            np.concatenate(rows_out),
+            np.concatenate(cols_out),
+            np.concatenate(values_out),
+        )
 
     def _cupy_candidates(
         self,

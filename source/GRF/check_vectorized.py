@@ -112,10 +112,17 @@ def check_index() -> None:
                     actual = [
                         (h.cui, h.surface, h.score, h.rank) for h in hits
                     ]
-                    assert actual == expected, (
+                    assert [a[:2] + (a[3],) for a in actual] == [
+                        e[:2] + (e[3],) for e in expected
+                    ], (
                         f"{label} top_k={top_k} source_kb={source_kb} "
                         f"row={row_number}\n  got {actual}\n  exp {expected}"
                     )
+                    for got_hit, exp_hit in zip(actual, expected):
+                        assert abs(got_hit[2] - exp_hit[2]) <= TOLERANCE, (
+                            f"{label} top_k={top_k} source_kb={source_kb} "
+                            f"row={row_number}: score {got_hit[2]} vs {exp_hit[2]}"
+                        )
                 # search() must agree with the single-row batch call.  It is the
                 # same code path at a different GEMM width, so the raw scores
                 # may differ in the last float32 ULP; the ordering may not.

@@ -219,8 +219,8 @@ class VectorIndex:
     def search_batch(self, queries, top_k: int, *,
                      source_kb: str | None = None
                      ) -> list[list[RetrievalHit]]
-    def use_gpu(self, device: str = "cuda") -> None   # pycauset CUDA routing
-    def release_gpu(self) -> None                     # stop CUDA routing
+    def use_gpu(self, device: str = "cuda") -> None   # CuPy row-block scan
+    def release_gpu(self) -> None                     # stop CUDA scoring
     @property
     def search_device(self) -> str                    # "cuda" | "cpu"
     def save(self, directory) -> None
@@ -232,15 +232,18 @@ class VectorIndex:
 
 Exact cosine scan (architecture permits exact). Deterministic ordering:
 score desc, then `cui`, then `surface`. Empty index -> `[]`, but query
-dimension is checked before the empty short-circuit. `search_batch` scores all
-rows with one `pycauset.matmul` (`Q @ A^T`) against the memory-mapped index,
-chunked to bound the transient `(rows, N)` score matrix; the chunk size shrinks
-automatically on large indexes (256 MiB score budget). `topk` runs in NumPy on
-the returned block, so hits keep the same score/cui/surface tie-break. The
-ordering rule matches the CPU path; scores can
-differ in the last float32 ULPs because the backend and BLAS reduce differently.
-`use_gpu()` enables `pycauset.cuda`, which routes the matmul to the device while
-the index stays file-backed; `release_gpu()` stops the routing. Save/load:
+dimension is checked before the empty short-circuit. A loaded index keeps its
+`vectors.npy` as a memmap; `search_batch` reads index row blocks from it and
+computes `Q @ A_block^T` one block at a time (NumPy/BLAS on CPU, CuPy on GPU
+when `use_gpu()` succeeded), keeping every entry at or above the block's k-th
+score. Neither the KB nor the full `(rows, N)` score matrix is materialised;
+block width follows the free device memory. `topk` runs on the returned
+candidates, so hits keep the same score/cui/surface tie-break. Scores can
+differ in the last float32 ULPs from BLAS reduce order.
+`use_gpu("cuda")` switches the scan to CuPy and requires an index that was
+loaded from an artifact (the memmap is what gets streamed); without CuPy or a
+CUDA device it raises and the notebooks stay on the CPU. `release_gpu()` stops
+GPU scoring. Save/load:
 `.npz` artifact; `load_npz` streams its `vectors.npy` member to a local cache
 (keyed by size/mtime) and memory-maps it. The directory form is
 `vectors.npy` + `meta.json` (no pickle); `encoder_info` is optional metadata
