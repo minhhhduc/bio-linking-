@@ -109,20 +109,30 @@ def _open_vectors(path: Path, backing_dir=None):
     )
 
 
-_MIN_SCORE_ELEMS = 1 << 26   # 256 MiB of float32
+_MIN_SCORE_BLOCK_BYTES = 1 << 28   # 256 MiB
+_MAX_SCORE_BLOCK_BYTES = 8 << 30   # 8 GiB
 
 
-def _score_block_elems() -> int:
-    """Float32 elements in one (queries x index) score block.
+def _score_block_bytes() -> int:
+    """RAM cap for one (queries x index) score block.
 
-    Every chunk is a full scan of the index, so the chunk should be as wide
-    as RAM allows: at 256 MiB a 1.5M-row KB needs ~20 passes, at 1 GiB only
-    ~4.  The block is tied to pycauset's in-RAM threshold -- above it each
-    block is written to a backing file and read back before top-k, which
-    costs more than the pass it saves.
+    One chunk is one full scan of the index, so wider is faster: at 256 MiB
+    a 3M-row KB takes ~11 passes for a 959-query batch, at 4 GiB ~2.  Top-k
+    peaks at roughly three blocks (native result, NumPy export, partition
+    copy), so the cap is a sixth of MemAvailable, clamped to 256 MiB..8 GiB.
     """
-    threshold = pc.get_memory_threshold() or (1 << 30)
-    return max(_MIN_SCORE_ELEMS, int(threshold) // 4)
+    free = 0
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    free = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        pass
+    if free <= 0:
+        free = 6 * (pc.get_memory_threshold() or (1 << 30))
+    return max(_MIN_SCORE_BLOCK_BYTES, min(free // 6, _MAX_SCORE_BLOCK_BYTES))
 
 
 class VectorIndex:
@@ -402,41 +412,49 @@ class VectorIndex:
         if candidates == 0:
             return empty
         columns = min(top_k, candidates)
-        chunk_rows = max(1, _score_block_elems() // count)
+        block_bytes = _score_block_bytes()
+        # Keep the score block in RAM: above pycauset's threshold each block
+        # is written to a backing file and read back before top-k.
+        previous_threshold = pc.get_memory_threshold()
+        pc.set_memory_threshold(block_bytes)
+        chunk_rows = max(1, block_bytes // 4 // count)
         results: list[list[RetrievalHit]] = []
-        for start in range(0, matrix.shape[0], chunk_rows):
-            chunk = matrix[start : start + chunk_rows]
-            # One matrix multiply over the whole index, as the contract says.
-            # ``index.vectors.T`` is a metadata-only view of the memory-mapped
-            # KB; the (rows, N) result is a bounded in-RAM block.
-            scores = pc.to_numpy(
-                pc.matmul(pc.matrix(chunk), self.vectors.T),
-                allow_huge=True,
-            )
-            # The source_kb filter only selects columns of that same score
-            # block, so a filtered and an unfiltered search score the same
-            # row identically.
-            block = scores if source_kb is None else scores[:, positions]
-            # np.partition returns a copy; the k-th largest of each row lands
-            # at index candidates - columns of that copy.
-            cutoff = np.partition(block, candidates - columns, axis=1)[
-                :, candidates - columns
-            ]
-            rows, cols = np.nonzero(block >= cutoff[:, None])
-            if rows.size == 0:
-                results.extend([[] for _ in range(chunk.shape[0])])
-                continue
-            values = block[rows, cols]
-            results.extend(
-                self._assemble(
-                    rows,
-                    positions[cols],
-                    values,
-                    columns,
-                    chunk.shape[0],
+        try:
+            for start in range(0, matrix.shape[0], chunk_rows):
+                chunk = matrix[start : start + chunk_rows]
+                # One matrix multiply over the whole index, as the contract says.
+                # ``index.vectors.T`` is a metadata-only view of the file-backed
+                # KB; the (rows, N) result is a bounded in-RAM block.
+                scores = pc.to_numpy(
+                    pc.matmul(pc.matrix(chunk), self.vectors.T),
+                    allow_huge=True,
                 )
-            )
-        return results
+                # The source_kb filter only selects columns of that same score
+                # block, so a filtered and an unfiltered search score the same
+                # row identically.
+                block = scores if source_kb is None else scores[:, positions]
+                # np.partition returns a copy; the k-th largest of each row lands
+                # at index candidates - columns of that copy.
+                cutoff = np.partition(block, candidates - columns, axis=1)[
+                    :, candidates - columns
+                ]
+                rows, cols = np.nonzero(block >= cutoff[:, None])
+                if rows.size == 0:
+                    results.extend([[] for _ in range(chunk.shape[0])])
+                    continue
+                values = block[rows, cols]
+                results.extend(
+                    self._assemble(
+                        rows,
+                        positions[cols],
+                        values,
+                        columns,
+                        chunk.shape[0],
+                    )
+                )
+            return results
+        finally:
+            pc.set_memory_threshold(previous_threshold)
 
     def _assemble(
         self,

@@ -80,12 +80,13 @@ S_{\text{chunk}} &= Q_{\text{chunk}} \cdot A^\top \in \mathbb{R}^{c \times N} \\
 \text{top-}k(S_{\text{chunk}}[i, :]) &\to \{(a, s_{ia})\}_{a \in \text{Top-}k}
 \end{aligned}$$
 
-- Số query mỗi chunk: `_score_block_elems() // N`, với
-  `max(2^26, ngưỡng-RAM-của-pycauset // 4)` float32 (mặc định 2^28 ≈ 1 GiB).
-  Mỗi chunk là **một lượt quét toàn index**, nên chunk càng rộng càng ít lượt:
-  cùng 959 query trên index 1,5M hàng, 256 MiB cần ~20 lượt, 1 GiB chỉ ~4.
-  Block lớn hơn ngưỡng RAM thì bị spill ra backing file rồi đọc lại để top-k,
-  tốn hơn số lượt tiết kiệm được.
+- Kích thước block điểm: `_score_block_bytes()` = $\lceil$`MemAvailable`$/6\rceil$,
+  kẹp trong 256 MiB..8 GiB; số query mỗi chunk = `block_bytes // 4 // N`. Mỗi
+  chunk là **một lượt quét toàn index**, nên block càng rộng càng ít lượt:
+  959 query trên index 3M hàng, 256 MiB cần ~11 lượt, 4 GiB chỉ ~2.
+- Trong lúc quét, ngưỡng RAM của `pycauset` được nâng lên đúng cỡ block rồi trả
+  lại trong `finally`: block nằm trong RAM thay vì spill ra backing file rồi
+  đọc lại để top-k.
 - Không chia phía index được: `pycauset` từ chối matmul trên view có offset
   (`matmul on views with offsets is not supported`), nên chỉ query mới cắt được.
 - Top-k dùng `np.partition` trên **bản copy** của block: giữ nguyên thứ tự cột,
