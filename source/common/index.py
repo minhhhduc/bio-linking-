@@ -109,6 +109,39 @@ def _open_vectors(path: Path, backing_dir=None):
     )
 
 
+def _preload_cuda_libraries() -> None:
+    """Load pip-installed CUDA libraries so CuPy's lazy ``dlopen`` finds them.
+
+    ``nvidia-*-cu12`` wheels put ``libcublas.so.12`` under site-packages and
+    do not add that directory to the loader path; CuPy opens the library by
+    SONAME later.  Loading it here with ``RTLD_GLOBAL`` registers the SONAME,
+    so the later ``dlopen`` resolves instead of raising
+    ``libcublas.so.12: cannot open shared object file``.
+    """
+    import ctypes
+    import sysconfig
+    from pathlib import Path
+
+    roots = [Path(sysconfig.get_paths()["purelib"])]
+    roots += [Path("/usr/local/cuda/lib64"), Path("/usr/lib/x86_64-linux-gnu")]
+    directories = []
+    for root in roots:
+        directories += [
+            root,
+            root / "nvidia" / "cuda_runtime" / "lib",
+            root / "nvidia" / "cublas" / "lib",
+        ]
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for pattern in ("libcudart.so*", "libcublas.so*", "libcublasLt.so*"):
+            for library in sorted(directory.glob(pattern)):
+                try:
+                    ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+
+
 class VectorIndex:
     """One entry per KB surface form; exact cosine scan at query time."""
 
@@ -320,6 +353,7 @@ class VectorIndex:
             raise ValueError("device must be 'cuda' or 'cpu'")
         if self._device == device:
             return
+        _preload_cuda_libraries()
         try:
             import cupy as cp
         except ImportError as exc:
