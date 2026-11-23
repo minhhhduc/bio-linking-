@@ -97,9 +97,15 @@ S_{\text{chunk}} &= Q_{\text{chunk}} \cdot A^\top \in \mathbb{R}^{c \times N} \\
 
 ## 5. GPU
 
-`index.use_gpu("cuda")` gọi `pycauset.cuda.enable()`; `pycauset` tự route phép
-nhân sang thiết bị. Không còn bản copy `torch` của toàn bộ KB trong VRAM/RAM —
-ma trận vẫn file-backed, chỉ chunk truy vấn và block điểm đi qua thiết bị.
+`index.use_gpu("cuda")` chấm điểm bằng `torch` — wheel `pycauset` trên PyPI là
+bản CPU, không có backend CUDA. Từng **block hàng** của index được copy lên
+VRAM, `Q · A_blockᵀ` chạy trên GPU, và chỉ các entry ≥ ngưỡng k-th của block
+được trả về CPU; KB không bao giờ nằm trọn trong VRAM.
+
+Cỡ block chọn theo VRAM trống (`torch.cuda.mem_get_info`): một hàng index tốn
+`4·d` byte vector + `5` byte mỗi query (điểm + mask), block ≈ 50% VRAM trống,
+query chunk phần còn lại. Bản `pycauset` tự build có CUDA được dùng làm
+fallback (`pycauset.cuda.enable()`).
 
 Notebook bọc lời gọi trong `try/except RuntimeError` và rơi về CPU nếu bản
 `pycauset` không có CUDA; `index.search_device` cho biết đang chạy ở đâu.

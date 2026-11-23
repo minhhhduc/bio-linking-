@@ -95,22 +95,22 @@ def _extract_vectors(path: Path, cache_dir) -> Path:
 _IMPORT_RAM_CEILING = 1 << 29
 
 
-def _open_vectors(path: Path, backing_dir=None):
-    """Open an extracted ``vectors.npy`` as a disk-backed matrix.
+def _open_vectors(source, backing_dir=None):
+    """Open an extracted ``vectors.npy`` memmap as a disk-backed matrix.
 
-    ``np.load(mmap_mode="r")`` never materialises the array, and the RAM
-    ceiling makes ``pycauset`` write its copy to a backing file instead of
-    refusing the import when the array is larger than available memory.
+    The RAM ceiling makes ``pycauset`` write its copy to a backing file
+    instead of refusing the import when the array is larger than memory.
     """
     if backing_dir is not None:
         pc.set_backing_dir(backing_dir)
-    return pc.matrix(
-        np.load(path, mmap_mode="r"), max_in_ram_bytes=_IMPORT_RAM_CEILING
-    )
+    return pc.matrix(source, max_in_ram_bytes=_IMPORT_RAM_CEILING)
 
 
 _MIN_SCORE_BLOCK_BYTES = 1 << 28   # 256 MiB
 _MAX_SCORE_BLOCK_BYTES = 8 << 30   # 8 GiB
+# Device budget when the torch path runs on CPU (smoke tests); a real CUDA
+# device reports its own free memory.
+_TORCH_CPU_PROBE_BYTES = 1 << 30
 
 
 def _score_block_bytes() -> int:
@@ -238,6 +238,11 @@ class VectorIndex:
         self.source_kbs = source_kbs
         self.encoder_info = encoder_info
         self._device: str | None = None
+        self._gpu_backend: str | None = None
+        # Raw rows (ndarray or .npy memmap) for the GPU scan, which streams
+        # row blocks to VRAM; a file-backed pycauset matrix cannot be sliced
+        # into matmul operands.
+        self._vector_source = array if isinstance(array, np.ndarray) else None
 
     @classmethod
     def from_concepts(
@@ -324,10 +329,11 @@ class VectorIndex:
         return self._device or "cpu"
 
     def use_gpu(self, device: str = "cuda") -> None:
-        """Route ``pycauset.matmul`` to the GPU.
+        """Score on the GPU.
 
-        The index stays file-backed: only the query chunk and its score block
-        cross to the device, so enabling CUDA does not copy the KB into VRAM.
+        ``torch`` streams index row blocks to VRAM and does the product
+        there; the KB never moves whole.  A ``pycauset`` build with a CUDA
+        backend is the fallback (then its own matmul is routed).
         """
         if device == "cpu":
             self.release_gpu()
@@ -336,21 +342,42 @@ class VectorIndex:
             raise ValueError("device must be 'cuda' or 'cpu'")
         if self._device == device:
             return
-        if not pc.cuda.is_available():
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and torch.cuda.is_available():
+            if len(self) and self._vector_source is None:
+                raise RuntimeError(
+                    "device='cuda' but this index has no raw vectors to "
+                    "stream; load it from an artifact first"
+                )
+            torch.cuda.empty_cache()
+            self._gpu_backend = "torch"
+        elif pc.cuda.is_available():
+            pc.cuda.enable()
+            self._gpu_backend = "pycauset"
+        else:
             raise RuntimeError(
-                "device='cuda' but this pycauset build has no CUDA backend; "
-                "use the CPU path or install a CUDA-enabled build."
+                "device='cuda' but neither torch nor this pycauset build "
+                "sees a CUDA device; use the CPU path"
             )
-        pc.cuda.enable()
         self._device = device
 
     def release_gpu(self) -> None:
-        """Stop routing matmuls to the GPU and release device memory."""
+        """Stop scoring on the GPU and release device memory."""
         self._device = None
+        self._gpu_backend = None
         try:
             pc.cuda.disable()
         except Exception:  # noqa: BLE001 - a CPU build has nothing to release
             pass
+        try:
+            import torch
+        except ImportError:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _validate_top_k(top_k: int) -> None:
@@ -456,6 +483,99 @@ class VectorIndex:
         finally:
             pc.set_memory_threshold(previous_threshold)
 
+    def _search_torch(
+        self,
+        matrix: np.ndarray,
+        top_k: int,
+        source_kb: str | None,
+        *,
+        device: str | None = None,
+    ) -> list[list[RetrievalHit]]:
+        """Exact cosine scan on the GPU through ``torch``.
+
+        Index row blocks are copied to the device one at a time and every
+        query is scored against the block there; only entries at or above
+        the block's k-th score come back, so the KB never sits in VRAM
+        whole.  A block can contribute at most k entries to one row's global
+        top-k, so a per-block cutoff cannot drop a candidate.
+        """
+        import torch
+
+        target = torch.device(device or self._device or "cuda")
+        count = len(self)
+        n_queries = matrix.shape[0]
+        empty: list[list[RetrievalHit]] = [[] for _ in range(n_queries)]
+        source = self._vector_source
+        if count == 0 or source is None:
+            return empty
+        positions = (
+            np.arange(count, dtype=np.int64)
+            if source_kb is None
+            else np.fromiter(
+                (
+                    index
+                    for index, name in enumerate(self.source_kbs)
+                    if name == source_kb
+                ),
+                dtype=np.int64,
+            )
+        )
+        candidates = int(positions.size)
+        if candidates == 0:
+            return empty
+        columns = min(top_k, candidates)
+        dim = int(self.vectors.shape[1])
+        if target.type == "cuda":
+            free, _ = torch.cuda.mem_get_info()
+        else:
+            free = _TORCH_CPU_PROBE_BYTES
+        # An index row costs its vector, one score column per query, and the
+        # byte-wide mask over that column; use half of the free VRAM.
+        row_bytes = 4 * dim + 5 * n_queries
+        block_rows = max(1, int(free * 0.5 // row_bytes))
+        queries_per_chunk = max(1, int(free * 0.2 // max(1, 4 * block_rows)))
+        results: list[list[RetrievalHit]] = []
+        for q_start in range(0, n_queries, queries_per_chunk):
+            q_block = matrix[q_start : q_start + queries_per_chunk]
+            q_gpu = torch.as_tensor(np.ascontiguousarray(q_block), device=target)
+            rows_all, cols_all, values_all = [], [], []
+            for start in range(0, count, block_rows):
+                stop = min(count, start + block_rows)
+                lo = int(np.searchsorted(positions, start, side="left"))
+                hi = int(np.searchsorted(positions, stop, side="left"))
+                if hi <= lo:
+                    continue
+                a_gpu = torch.tensor(source[start:stop], device=target)
+                scores = q_gpu @ a_gpu.T
+                del a_gpu
+                if source_kb is not None:
+                    scores = scores.index_select(
+                        1,
+                        torch.as_tensor(positions[lo:hi] - start, device=target),
+                    )
+                width = hi - lo
+                kth = min(columns, width)
+                cutoff = torch.kthvalue(scores, width - kth + 1, dim=1).values
+                rows, cols = (scores >= cutoff[:, None]).nonzero(as_tuple=True)
+                rows_all.append(rows.cpu().numpy())
+                cols_all.append(positions[lo:hi][cols.cpu().numpy()])
+                values_all.append(scores[rows, cols].cpu().numpy())
+                del scores
+            if not rows_all:
+                results.extend([[] for _ in range(q_block.shape[0])])
+                continue
+            results.extend(
+                self._assemble(
+                    np.concatenate(rows_all),
+                    np.concatenate(cols_all),
+                    np.concatenate(values_all),
+                    columns,
+                    q_block.shape[0],
+                )
+            )
+            del q_gpu
+        return results
+
     def _assemble(
         self,
         columns_of_row: np.ndarray,
@@ -546,6 +666,8 @@ class VectorIndex:
         if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
             raise ValueError("every query must have a non-zero norm")
         matrix = as_unit_rows(matrix)
+        if self._device == "cuda" and self._gpu_backend == "torch":
+            return self._search_torch(matrix, top_k, source_kb)
         return self._search(matrix, top_k, source_kb)
 
     def search(
@@ -656,7 +778,10 @@ class VectorIndex:
                     f"cuis ({len(cuis)})"
                 )
 
-        vectors = _open_vectors(_extract_vectors(path, cache_dir), cache_dir)
+        source = np.load(
+            _extract_vectors(path, cache_dir), mmap_mode="r"
+        )
+        vectors = _open_vectors(source, cache_dir)
         if vectors.shape[0] != len(cuis):
             raise ValueError(
                 f"{path}: meta count {meta.get('count')!r} disagrees with "
@@ -668,18 +793,21 @@ class VectorIndex:
                 f"shape {vectors.shape!r}"
             )
 
-        return cls(
+        index = cls(
             vectors,
             cuis,
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
         )
+        index._vector_source = source
+        return index
 
     @classmethod
     def load(cls, directory) -> "VectorIndex":
         base = Path(directory)
-        vectors = _open_vectors(base / "vectors.npy")
+        source = np.load(base / "vectors.npy", mmap_mode="r")
+        vectors = _open_vectors(source)
         with (base / "meta.json").open("r", encoding="utf-8-sig") as handle:
             meta = json.load(handle)
 
@@ -721,10 +849,12 @@ class VectorIndex:
                     f"meta.json {name!r} must be a list of length {count}"
                 )
 
-        return cls(
+        index = cls(
             vectors,
             cuis,
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
         )
+        index._vector_source = source
+        return index
