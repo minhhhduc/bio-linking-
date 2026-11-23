@@ -34,9 +34,12 @@ Nạp index **không** đọc cả KB vào RAM:
 1. `VectorIndex.load_npz(path, cache_dir=...)` stream member `vectors.npy` từ
    file `.npz` (zip) ra một thư mục cache **local** — `zipfile` + `copyfileobj`
    theo block, không `np.load` cả mảng.
-2. `pycauset.load_npy(cache/vectors.npy)` mở file đó thành ma trận
-   `Float32Matrix` **file-backed** (memory-mapped): các trang dữ liệu do OS nạp
-   khi bị chạm tới, không cấp phát $N \times d$ float trong heap Python.
+2. `np.load(cache/vectors.npy, mmap_mode="r")` rồi
+   `pycauset.matrix(..., max_in_ram_bytes=512 MiB)`: pycauset ghi payload vào
+   một **backing file** trên đĩa và ma trận chỉ trỏ tới file đó, nên không cấp
+   phát $N \times d$ float trong heap. `np.load` thường (hay `pycauset.load_npy`,
+   vốn `np.load` rồi copy) nạp cả mảng vào RAM và bị `MemoryGovernor` từ chối
+   khi KB lớn hơn RAM trống.
 3. Metadata (`cuis`, `surfaces`, `source_kbs`, `encoder_info`) đọc từ `meta`.
 
 Cache được đặt tên theo `(kích thước, mtime)` của file `.npz`, nên build lại KB
@@ -60,8 +63,11 @@ scores = pc.to_numpy(
 )                                                         # -> ndarray (b, N)
 ```
 
-- `index.vectors.T` là **view** của ma trận memory-mapped (chỉ đổi metadata,
+- `index.vectors.T` là **view** của ma trận file-backed (chỉ đổi metadata,
   không copy payload).
+- Operand file-backed được đọc theo **tile**: chỉ tile đang tính nằm trong
+  RAM/VRAM, không bao giờ cả ma trận — đường offload đĩa → RAM (prefetch) →
+  GPU do `pycauset` tự điều phối.
 - Kết quả `(b, N)` là ma trận tính toán trong RAM, kích thước bị chặn bởi
   chunk (xem §4); `np.asarray`/`to_numpy` trên block nhỏ là hợp lệ.
 - `pycauset` không có `topk`: top-k làm bằng `numpy` trên block điểm đó (§4).

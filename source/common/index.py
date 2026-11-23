@@ -3,9 +3,10 @@
 Vectors are stored L2-normalised as float32, so a dot product is cosine
 similarity.  The index is a ``pycauset`` matrix: persisted as a single
 ``.npz`` file (:meth:`VectorIndex.save_npz`) but **loaded** by streaming its
-``vectors.npy`` member to local disk and memory-mapping it
-(:meth:`VectorIndex.load_npz`), so the KB is never held whole in RAM.  Scoring
-is ``pycauset.matmul`` over that disk-backed matrix; top-k stays in NumPy
+``vectors.npy`` member to local disk and importing it under a RAM ceiling
+(:meth:`VectorIndex.load_npz`), so the payload lives in a backing file and the
+KB is never held whole in RAM.  Scoring is ``pycauset.matmul`` over that
+disk-backed matrix; top-k stays in NumPy
 (``pycauset`` has no ``topk``).  A directory form (``vectors.npy`` +
 ``meta.json``, :meth:`VectorIndex.save`/:meth:`VectorIndex.load`) is still
 supported; neither form uses pickle.
@@ -86,6 +87,26 @@ def _extract_vectors(path: Path, cache_dir) -> Path:
             shutil.copyfileobj(source, sink, length=1 << 20)
     staging.replace(target)
     return target
+
+
+# Importing a ``.npy`` into ``pycauset`` copies it into native storage.  Above
+# this ceiling that copy is a backing file on disk, not RAM, so a KB larger
+# than free memory still loads; below it the RAM copy is cheap and faster.
+_IMPORT_RAM_CEILING = 1 << 29
+
+
+def _open_vectors(path: Path, backing_dir=None):
+    """Open an extracted ``vectors.npy`` as a disk-backed matrix.
+
+    ``np.load(mmap_mode="r")`` never materialises the array, and the RAM
+    ceiling makes ``pycauset`` write its copy to a backing file instead of
+    refusing the import when the array is larger than available memory.
+    """
+    if backing_dir is not None:
+        pc.set_backing_dir(backing_dir)
+    return pc.matrix(
+        np.load(path, mmap_mode="r"), max_in_ram_bytes=_IMPORT_RAM_CEILING
+    )
 
 
 class VectorIndex:
@@ -575,8 +596,9 @@ class VectorIndex:
         """Load an index written by :meth:`save_npz`.
 
         The ``vectors.npy`` member is streamed to ``cache_dir`` (default:
-        ``tempfile.gettempdir()/grf_kb_npy``) and memory-mapped there, so the
-        KB is never decompressed into the Python heap as one array.
+        ``tempfile.gettempdir()/grf_kb_npy``) and imported under a RAM
+        ceiling, so a KB larger than free memory lands in a backing file
+        instead of the Python heap.
         """
         path = Path(path)
         with np.load(path, allow_pickle=False) as data:
@@ -607,7 +629,7 @@ class VectorIndex:
                     f"cuis ({len(cuis)})"
                 )
 
-        vectors = pc.load_npy(_extract_vectors(path, cache_dir))
+        vectors = _open_vectors(_extract_vectors(path, cache_dir), cache_dir)
         if vectors.shape[0] != len(cuis):
             raise ValueError(
                 f"{path}: meta count {meta.get('count')!r} disagrees with "
@@ -630,7 +652,7 @@ class VectorIndex:
     @classmethod
     def load(cls, directory) -> "VectorIndex":
         base = Path(directory)
-        vectors = pc.load_npy(base / "vectors.npy")
+        vectors = _open_vectors(base / "vectors.npy")
         with (base / "meta.json").open("r", encoding="utf-8-sig") as handle:
             meta = json.load(handle)
 
