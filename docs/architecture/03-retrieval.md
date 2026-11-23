@@ -34,12 +34,13 @@ Nạp index **không** đọc cả KB vào RAM:
 1. `VectorIndex.load_npz(path, cache_dir=...)` stream member `vectors.npy` từ
    file `.npz` (zip) ra một thư mục cache **local** — `zipfile` + `copyfileobj`
    theo block, không `np.load` cả mảng.
-2. `np.load(cache/vectors.npy, mmap_mode="r")` rồi
-   `pycauset.matrix(..., max_in_ram_bytes=512 MiB)`: pycauset ghi payload vào
-   một **backing file** trên đĩa và ma trận chỉ trỏ tới file đó, nên không cấp
-   phát $N \times d$ float trong heap. `np.load` thường (hay `pycauset.load_npy`,
-   vốn `np.load` rồi copy) nạp cả mảng vào RAM và bị `MemoryGovernor` từ chối
-   khi KB lớn hơn RAM trống.
+2. `np.load(cache/vectors.npy, mmap_mode="r")` — chỉ mở mmap, **không** copy.
+   Ma trận `pycauset` chỉ được dựng khi thật sự cần (đường CPU hoặc `save`),
+   qua `pycauset.matrix(..., max_in_ram_bytes=512 MiB)`: pycauset ghi payload
+   vào một **backing file** trên đĩa nên không cấp phát $N \times d$ float
+   trong heap. `np.load` thường (hay `pycauset.load_npy`, vốn `np.load` rồi
+   copy) nạp cả mảng vào RAM và bị `MemoryGovernor` từ chối khi KB lớn hơn
+   RAM trống; đường GPU dùng thẳng memmap nên không dựng pycauset.
 3. Metadata (`cuis`, `surfaces`, `source_kbs`, `encoder_info`) đọc từ `meta`.
 
 Cache được đặt tên theo `(kích thước, mtime)` của file `.npz`, nên build lại KB
@@ -146,3 +147,33 @@ $$ \text{Candidates} = \text{argsort}_{c} \big( -\text{Score}(c), c \big)[:k_{\t
 
 Trả về danh sách `(cui, score, surface_rep)` đã sắp xếp; đây là đầu vào của
 re-ranker (stage riêng biệt, không thuộc retrieval).
+
+## 9. Đường out-of-core: đĩa → RAM → VRAM
+
+```text
+  Đĩa (local)                       RAM                        GPU (VRAM)
+  ┌───────────────────┐   block    ┌──────────────┐   PCIe   ┌────────────────┐
+  │ vectors.npy (mmap)│ ─────────▶ │  A_block     │ ───────▶ │   A_block      │
+  │ N × d, float32    │  prefetch  │  (b × d view)│          │  Q · A_blockᵀ  │
+  └───────────────────┘            └──────────────┘          └───────┬────────┘
+                                                                     │ k-th
+       chỉ entry ≥ ngưỡng k-th của block về CPU  ◀───────────────────┘
+```
+
+| Sơ đồ tham chiếu | Ở đây |
+| --- | --- |
+| Zarr chunks trên SSD | `vectors.npy` + `np.load(mmap_mode="r")`: chunk theo **hàng**, không nén, mmap sẵn |
+| Dask scheduling + prefetch block | vòng lặp block trong `VectorIndex._search_torch`; page cache của OS lo prefetch |
+| CuPy trên VRAM | `torch` cùng vai trò (`torch.matmul`, `torch.kthvalue`) |
+| Ghi kết quả về đĩa | không cần: mỗi query chỉ giữ `k` entry, block điểm giải phóng ngay sau khi cắt |
+
+Bất biến: **không bước nào giữ toàn bộ KB**. `load_npz` chỉ mở `.npy` bằng
+mmap (không copy), `len(index)`/shape đọc từ memmap, đường GPU đọc từng block
+rồi chuyển sang VRAM, đường CPU mới dựng ma trận `pycauset` file-backed và
+cũng chỉ trả về block điểm.
+
+Không dùng Zarr/Dask/CuPy: mmap đã cho chunk theo hàng đúng thứ tự truy vấn,
+lịch block là một vòng lặp tuyến tính (Dask không thêm gì), và `torch` đã có
+mặt cho encoder — thêm ba dependency không đổi khả năng. `pycauset` là cùng ý
+tưởng ở tầng thấp hơn nhưng trả về nguyên block điểm, nên phía gọi vẫn phải
+cắt query (§4).

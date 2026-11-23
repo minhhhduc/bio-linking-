@@ -146,11 +146,14 @@ class VectorIndex:
         source_kbs: Sequence[str | None] | None = None,
         *,
         encoder_info: Mapping[str, str] | None = None,
+        file_backed: bool = False,
     ) -> None:
-        # A loaded artifact arrives as a disk-backed ``pycauset`` matrix: it is
-        # already L2-normalised (the writer normalised it once), so it must not
-        # be copied through a NumPy array — that would put the whole KB in RAM.
-        if isinstance(vectors, np.ndarray):
+        # A loaded artifact arrives as a ``.npy`` memmap (already normalised
+        # by the writer) and must not be copied — the KB stays on disk.  A
+        # plain ndarray is copied and normalised once here.
+        if file_backed:
+            array = vectors
+        elif isinstance(vectors, np.ndarray):
             array = np.array(vectors, dtype=np.float32, copy=True)
         else:
             array = vectors
@@ -216,7 +219,10 @@ class VectorIndex:
                 "duplicate surface entries waste Top-k slots"
             )
 
-        if isinstance(array, np.ndarray):
+        if file_backed:
+            # Already normalised once by the writer; keep the memmap as-is.
+            pass
+        elif isinstance(array, np.ndarray):
             if not np.all(np.isfinite(array)):
                 raise ValueError("vectors contain non-finite values")
             if count:
@@ -227,11 +233,6 @@ class VectorIndex:
                 # them once) are stored as given; only a raw row is scaled, and
                 # then exactly once.
                 array = as_unit_rows(array)
-            # One copy into ``pycauset`` storage so the scan is a single
-            # ``pycauset.matmul`` against a matrix the backend owns.
-            self.vectors = pc.matrix(array) if count else array
-        else:
-            self.vectors = array
 
         self.cuis = cuis
         self.surfaces = surfaces
@@ -239,10 +240,29 @@ class VectorIndex:
         self.encoder_info = encoder_info
         self._device: str | None = None
         self._gpu_backend: str | None = None
-        # Raw rows (ndarray or .npy memmap) for the GPU scan, which streams
+        # Raw rows (ndarray or .npy memmap) for the torch scan, which streams
         # row blocks to VRAM; a file-backed pycauset matrix cannot be sliced
         # into matmul operands.
         self._vector_source = array if isinstance(array, np.ndarray) else None
+        self._vectors_pc = None if isinstance(array, np.ndarray) else array
+        self._backing_dir = None
+
+    @property
+    def vectors(self):
+        """The vectors as a ``pycauset`` matrix, imported on first use.
+
+        A loaded artifact keeps only the ``.npy`` memmap until something
+        needs the pycauset scan (the CPU path, save, or an export); the GPU
+        scan reads the memmap block by block and never builds it.
+        """
+        if self._vectors_pc is None:
+            source = self._vector_source
+            self._vectors_pc = (
+                _open_vectors(source, self._backing_dir)
+                if source is not None and len(source)
+                else source
+            )
+        return self._vectors_pc
 
     @classmethod
     def from_concepts(
@@ -318,6 +338,9 @@ class VectorIndex:
         )
 
     def __len__(self) -> int:
+        source = self._vector_source
+        if source is not None:
+            return int(source.shape[0])
         return int(self.vectors.shape[0])
 
     # ------------------------------------------------------------------
@@ -524,7 +547,7 @@ class VectorIndex:
         if candidates == 0:
             return empty
         columns = min(top_k, candidates)
-        dim = int(self.vectors.shape[1])
+        dim = int(self._vector_source.shape[1])
         if target.type == "cuda":
             free, _ = torch.cuda.mem_get_info()
         else:
@@ -655,10 +678,15 @@ class VectorIndex:
             raise ValueError(f"queries must be 2-D, got shape {matrix.shape!r}")
         if matrix.shape[0] == 0:
             return []
-        if matrix.shape[1] != self.vectors.shape[1]:
+        dimension = int(
+            self._vector_source.shape[1]
+            if self._vector_source is not None
+            else self.vectors.shape[1]
+        )
+        if matrix.shape[1] != dimension:
             raise ValueError(
                 f"query dimension {matrix.shape[1]} does not match index "
-                f"dimension {self.vectors.shape[1]}"
+                f"dimension {dimension}"
             )
         if not np.all(np.isfinite(matrix)):
             raise ValueError("queries contain non-finite values")
@@ -781,33 +809,32 @@ class VectorIndex:
         source = np.load(
             _extract_vectors(path, cache_dir), mmap_mode="r"
         )
-        vectors = _open_vectors(source, cache_dir)
-        if vectors.shape[0] != len(cuis):
+        if source.shape[0] != len(cuis):
             raise ValueError(
                 f"{path}: meta count {meta.get('count')!r} disagrees with "
-                f"vectors ({vectors.shape[0]})"
+                f"vectors ({source.shape[0]})"
             )
-        if meta.get("dim") != vectors.shape[1]:
+        if meta.get("dim") != source.shape[1]:
             raise ValueError(
                 f"{path}: meta dim {meta.get('dim')!r} disagrees with vectors "
-                f"shape {vectors.shape!r}"
+                f"shape {source.shape!r}"
             )
 
         index = cls(
-            vectors,
+            source,
             cuis,
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
+            file_backed=True,
         )
-        index._vector_source = source
+        index._backing_dir = cache_dir
         return index
 
     @classmethod
     def load(cls, directory) -> "VectorIndex":
         base = Path(directory)
         source = np.load(base / "vectors.npy", mmap_mode="r")
-        vectors = _open_vectors(source)
         with (base / "meta.json").open("r", encoding="utf-8-sig") as handle:
             meta = json.load(handle)
 
@@ -818,8 +845,8 @@ class VectorIndex:
         if missing:
             raise ValueError(f"meta.json is missing keys: {', '.join(missing)}")
 
-        if len(vectors.shape) != 2:
-            raise ValueError(f"saved vectors must be 2-D, got {vectors.shape!r}")
+        if len(source.shape) != 2:
+            raise ValueError(f"saved vectors must be 2-D, got {source.shape!r}")
 
         count = meta["count"]
         dim = meta["dim"]
@@ -830,10 +857,10 @@ class VectorIndex:
             or not isinstance(dim, int)
         ):
             raise ValueError("meta.json count/dim must be integers")
-        if count != vectors.shape[0] or dim != vectors.shape[1]:
+        if count != source.shape[0] or dim != source.shape[1]:
             raise ValueError(
                 "meta.json disagrees with vectors.npy shape "
-                f"({count=}, {dim=}, {vectors.shape=})"
+                f"({count=}, {dim=}, {source.shape=})"
             )
 
         cuis = meta["cuis"]
@@ -849,12 +876,11 @@ class VectorIndex:
                     f"meta.json {name!r} must be a list of length {count}"
                 )
 
-        index = cls(
-            vectors,
+        return cls(
+            source,
             cuis,
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
+            file_backed=True,
         )
-        index._vector_source = source
-        return index
