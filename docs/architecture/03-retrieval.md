@@ -34,12 +34,10 @@ Nạp index **không** đọc cả KB vào RAM:
 1. `VectorIndex.load_npz(path, cache_dir=...)` stream member `vectors.npy` từ
    file `.npz` (zip) ra một thư mục cache **local** — `zipfile` + `copyfileobj`
    theo block, không `np.load` cả mảng.
-2. `np.load(cache/vectors.npy, mmap_mode="r")` rồi
-   `pycauset.matrix(..., max_in_ram_bytes=512 MiB)`: pycauset ghi payload vào
-   một **backing file** trên đĩa và ma trận chỉ trỏ tới file đó, nên không cấp
-   phát $N \times d$ float trong heap. `np.load` thường (hay `pycauset.load_npy`,
-   vốn `np.load` rồi copy) nạp cả mảng vào RAM và bị `MemoryGovernor` từ chối
-   khi KB lớn hơn RAM trống.
+2. `np.load(cache/vectors.npy, mmap_mode="r")` — chỉ mở mmap, **không** copy.
+   Ma trận `pycauset` chỉ được dựng khi ai đó đọc thuộc tính `vectors` (ví dụ
+   bước verify của `build_KB`); cả hai đường quét đều đọc thẳng memmap nên
+   không cần nó.
 3. Metadata (`cuis`, `surfaces`, `source_kbs`, `encoder_info`) đọc từ `meta`.
 
 Cache được đặt tên theo `(kích thước, mtime)` của file `.npz`, nên build lại KB
@@ -51,39 +49,38 @@ truyền `cache_dir` để đổi chỗ (ví dụ `/content/grf_kb_npy`).
 > không memory-map được. Muốn mmap phải có `.npy` thô trên đĩa — đó là lý do
 > bước extract tồn tại.
 
-## 3. Phép nhân ma trận: `pycauset.matmul`
+## 3. Phép nhân ma trận: block hàng
 
-Retrieval **không dùng `torch.matmul`**. Phép chấm điểm là một lời gọi
-`pycauset.matmul` trên operand file-backed:
+Index là `.npy` mmap nên được đọc **từng block hàng** rồi nhân với cả batch
+query — không dựng ma trận `(b, N)` đầy đủ:
 
 ```python
-scores = pc.to_numpy(
-    pc.matmul(pc.matrix(query_chunk), index.vectors.T),  # (b, d) @ (d, N)
-    allow_huge=True,
-)                                                         # -> ndarray (b, N)
+block = source[start:stop]                # memmap, blk × d
+scores = queries @ block.T                # NumPy/BLAS trên CPU
+# hoặc: torch.tensor(block, device="cuda") rồi queries_gpu @ a.T
+cutoff = partition(scores, w - k)         # điểm lớn thứ k của mỗi hàng
+rows, cols = nonzero(scores >= cutoff[:, None])
 ```
 
-- `index.vectors.T` là **view** của ma trận file-backed (chỉ đổi metadata,
-  không copy payload).
-- Operand file-backed được đọc theo **tile**: chỉ tile đang tính nằm trong
-  RAM/VRAM, không bao giờ cả ma trận — đường offload đĩa → RAM (prefetch) →
-  GPU do `pycauset` tự điều phối.
-- Kết quả `(b, N)` là ma trận tính toán trong RAM, kích thước bị chặn bởi
-  chunk (xem §4); `np.asarray`/`to_numpy` trên block nhỏ là hợp lệ.
-- `pycauset` không có `topk`: top-k làm bằng `numpy` trên block điểm đó (§4).
-- Sai khác float32 so với BLAS chỉ ở ULP cuối; quy tắc thứ tự giữ nguyên.
+- Chỉ block đang tính nằm trong RAM (hoặc VRAM); KB không bao giờ nằm trọn —
+  đường offload đĩa → RAM (prefetch của OS) → GPU do vòng lặp block điều phối.
+- Block điểm `(q, blk)` bị chặn bởi bộ nhớ trống của thiết bị, không bởi kích
+  thước index (§4).
+- Không backend nào có `topk`: ngưỡng k-th lấy bằng `np.partition` /
+  `torch.kthvalue`, sau đó giữ **mọi** entry ≥ ngưỡng (§4).
+- Sai khác float32 giữa BLAS và torch chỉ ở ULP cuối; quy tắc thứ tự giữ nguyên.
 
 ## 4. Chunking và top-k
 
 $$\begin{aligned}
-S_{\text{chunk}} &= Q_{\text{chunk}} \cdot A^\top \in \mathbb{R}^{c \times N} \\
-\text{top-}k(S_{\text{chunk}}[i, :]) &\to \{(a, s_{ia})\}_{a \in \text{Top-}k}
+S_{\text{block}} &= Q \cdot A_{\text{block}}^\top \in \mathbb{R}^{q \times b} \\
+\text{top-}k(S_{\text{block}}[i, :]) &\to \{(a, s_{ia})\}_{a \in \text{Top-}k}
 \end{aligned}$$
 
-- Số query mỗi chunk: `min(_QUERY_CHUNK=256, _SCORE_BUDGET // N)` với
-  `_SCORE_BUDGET = 2^26` float32 (≈256 MiB) — block điểm không phình theo kích
-  thước index lẫn batch.
-- Top-k dùng `np.partition` trên **bản copy** của block: giữ nguyên thứ tự cột,
+- Số hàng index mỗi block = `free_bytes // 3 // (4·d + 5·q)`: một hàng tốn
+  `4·d` byte vector + `4+1` byte mỗi query (điểm + mask), dùng một phần ba bộ
+  nhớ trống (`MemAvailable` trên CPU, `torch.cuda.mem_get_info` trên GPU).
+- Top-k dùng partition trên **bản copy** của block: giữ nguyên thứ tự cột,
   nên cột vẫn trỏ đúng hàng index; mọi entry bằng điểm cắt được giữ, để tie-break
   theo `(-score, cui, surface)` thay vì theo thứ tự partition.
 - Lọc `source_kb`: chỉ chọn **cột** của cùng block điểm đó, nên một hàng được
@@ -91,14 +88,14 @@ S_{\text{chunk}} &= Q_{\text{chunk}} \cdot A^\top \in \mathbb{R}^{c \times N} \\
 
 ## 5. GPU
 
-`index.use_gpu("cuda")` chấm điểm bằng **CuPy** — `pycauset` là bản CPU, không
+`index.use_gpu("cuda")` chấm điểm bằng **torch** (đã có sẵn cho encoder). `pycauset` là bản CPU, không
 có backend CUDA. Index vẫn là `.npy` memmap trên đĩa: từng **block hàng** được
 copy sang VRAM, `Q · A_blockᵀ` chạy trên GPU, chỉ các entry ≥ ngưỡng k-th của
 block trả về CPU. KB không bao giờ nằm trọn trong VRAM; cỡ block lấy từ VRAM
 trống (`cp.cuda.Device().mem_info`).
 
 Notebook bọc lời gọi trong `try/except RuntimeError` và rơi về CPU nếu môi
-trường không có CuPy/CUDA; `index.search_device` cho biết đang chạy ở đâu.
+trường không có CUDA; `index.search_device` cho biết đang chạy ở đâu.
 Chi tiết phép nhân: [matmul](08-matmul.md).
 
 ## 6. Lô hoá

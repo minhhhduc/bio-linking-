@@ -89,59 +89,6 @@ def _extract_vectors(path: Path, cache_dir) -> Path:
     return target
 
 
-# Importing a ``.npy`` into ``pycauset`` copies it into native storage.  Above
-# this ceiling that copy is a backing file on disk, not RAM, so a KB larger
-# than free memory still loads; below it the RAM copy is cheap and faster.
-_IMPORT_RAM_CEILING = 1 << 29
-
-
-def _open_vectors(path: Path, backing_dir=None):
-    """Open an extracted ``vectors.npy`` as a disk-backed matrix.
-
-    ``np.load(mmap_mode="r")`` never materialises the array, and the RAM
-    ceiling makes ``pycauset`` write its copy to a backing file instead of
-    refusing the import when the array is larger than available memory.
-    """
-    if backing_dir is not None:
-        pc.set_backing_dir(backing_dir)
-    return pc.matrix(
-        np.load(path, mmap_mode="r"), max_in_ram_bytes=_IMPORT_RAM_CEILING
-    )
-
-
-def _preload_cuda_libraries() -> None:
-    """Load pip-installed CUDA libraries so CuPy's lazy ``dlopen`` finds them.
-
-    ``nvidia-*-cu12`` wheels put ``libcublas.so.12`` under site-packages and
-    do not add that directory to the loader path; CuPy opens the library by
-    SONAME later.  Loading it here with ``RTLD_GLOBAL`` registers the SONAME,
-    so the later ``dlopen`` resolves instead of raising
-    ``libcublas.so.12: cannot open shared object file``.
-    """
-    import ctypes
-    import sysconfig
-    from pathlib import Path
-
-    roots = [Path(sysconfig.get_paths()["purelib"])]
-    roots += [Path("/usr/local/cuda/lib64"), Path("/usr/lib/x86_64-linux-gnu")]
-    directories = []
-    for root in roots:
-        directories += [
-            root,
-            root / "nvidia" / "cuda_runtime" / "lib",
-            root / "nvidia" / "cublas" / "lib",
-        ]
-    for directory in directories:
-        if not directory.is_dir():
-            continue
-        for pattern in ("libcudart.so*", "libcublas.so*", "libcublasLt.so*"):
-            for library in sorted(directory.glob(pattern)):
-                try:
-                    ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
-                except OSError:
-                    pass
-
-
 def _free_ram_bytes() -> int:
     """Free physical memory in bytes, or 0 when the platform hides it."""
     try:
@@ -196,11 +143,13 @@ class VectorIndex:
         source_kbs: Sequence[str | None] | None = None,
         *,
         encoder_info: Mapping[str, str] | None = None,
+        file_backed: bool = False,
     ) -> None:
-        # A loaded artifact arrives as a disk-backed ``pycauset`` matrix: it is
-        # already L2-normalised (the writer normalised it once), so it must not
-        # be copied through a NumPy array — that would put the whole KB in RAM.
-        if isinstance(vectors, np.ndarray):
+        # A loaded artifact arrives as a ``.npy`` memmap that the writer already
+        # L2-normalised; copying it would put the whole KB in RAM.
+        if file_backed:
+            array = vectors
+        elif isinstance(vectors, np.ndarray):
             array = np.array(vectors, dtype=np.float32, copy=True, order="C")
         else:
             array = vectors
@@ -266,7 +215,7 @@ class VectorIndex:
                 "duplicate surface entries waste Top-k slots"
             )
 
-        if isinstance(array, np.ndarray):
+        if isinstance(array, np.ndarray) and not file_backed:
             if not np.all(np.isfinite(array)):
                 raise ValueError("vectors contain non-finite values")
             if count:
@@ -277,22 +226,38 @@ class VectorIndex:
                 # them once) are stored as given; only a raw row is scaled, and
                 # then exactly once.
                 array = as_unit_rows(array)
-            # One copy into ``pycauset`` storage so the scan is a single
-            # ``pycauset.matmul`` against a matrix the backend owns.
-            self.vectors = pc.matrix(array) if count else array
-        else:
-            self.vectors = array
 
         self.cuis = cuis
         self.surfaces = surfaces
         self.source_kbs = source_kbs
         self.encoder_info = encoder_info
         self._device: str | None = None
-        self._gpu_backend: str | None = None
-        # The extracted ``vectors.npy`` behind :attr:`vectors`, when the index
-        # was loaded from an artifact.  The GPU scan streams row blocks from
-        # this file; pycauset matrices cannot be sliced into operands.
+        # Raw rows (ndarray or .npy memmap): both scans read blocks from here.
+        self._vector_source = array if isinstance(array, np.ndarray) else None
+        # ``vectors`` builds a pycauset matrix on first use; nothing in the
+        # scan needs it any more, and a 27 GB import is not free.
+        self._vectors_pc = array if not isinstance(array, np.ndarray) else None
+        # The extracted ``vectors.npy`` behind a loaded artifact.
         self._npy_path: Path | None = None
+
+    @property
+    def vectors(self):
+        """The vectors as a ``pycauset`` matrix, imported on first use."""
+        if self._vectors_pc is None:
+            source = self._vector_source
+            limit = _free_ram_bytes() // 3 or None
+            self._vectors_pc = (
+                pc.matrix(source, max_in_ram_bytes=limit)
+                if source is not None and len(source)
+                else source
+            )
+        return self._vectors_pc
+
+    def _dimension(self) -> int:
+        source = self._vector_source
+        if source is not None:
+            return int(source.shape[1])
+        return int(self.vectors.shape[1])
 
     @classmethod
     def from_concepts(
@@ -368,6 +333,9 @@ class VectorIndex:
         )
 
     def __len__(self) -> int:
+        source = self._vector_source
+        if source is not None:
+            return int(source.shape[0])
         return int(self.vectors.shape[0])
 
     # ------------------------------------------------------------------
@@ -379,10 +347,11 @@ class VectorIndex:
         return self._device or "cpu"
 
     def use_gpu(self, device: str = "cuda") -> None:
-        """Score on the GPU with CuPy.
+        """Score on the GPU with ``torch``.
 
-        ``cupy`` runs ``Q · A_blockᵀ`` on index row blocks copied to VRAM;
-        the KB stays memory-mapped on disk and is never copied whole.
+        torch is the runtime the encoder already uses on Colab; it runs
+        ``Q · A_blockᵀ`` on index row blocks copied to VRAM, so the KB stays
+        on disk and nothing new needs installing.
         """
         if device == "cpu":
             self.release_gpu()
@@ -391,38 +360,33 @@ class VectorIndex:
             raise ValueError("device must be 'cuda' or 'cpu'")
         if self._device == device:
             return
-        _preload_cuda_libraries()
-        try:
-            import cupy as cp
-        except ImportError as exc:
-            raise RuntimeError(
-                "device='cuda' needs CuPy; install the build for your CUDA "
-                "runtime (e.g. pip install cupy-cuda12x)"
-            ) from exc
-        try:
-            cp.cuda.runtime.getDeviceCount()
-        except Exception as exc:  # noqa: BLE001 - CuPy raises its own error type
-            raise RuntimeError(
-                "device='cuda' but CuPy sees no CUDA device; use the CPU path"
-            ) from exc
-        if self._npy_path is None and not isinstance(self.vectors, np.ndarray):
+        if self._vector_source is None:
             raise RuntimeError(
                 "device='cuda' needs the raw rows; load the index from an "
                 "artifact so it has a .npy memmap to stream"
             )
-        cp.get_default_memory_pool().free_all_blocks()
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "device='cuda' needs torch with a CUDA build"
+            ) from exc
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "device='cuda' but torch sees no CUDA device; use the CPU path"
+            )
+        torch.cuda.empty_cache()
         self._device = device
-        self._gpu_backend = "cupy"
 
     def release_gpu(self) -> None:
         """Stop scoring on the GPU and release device memory."""
         self._device = None
-        self._gpu_backend = None
         try:
-            import cupy as cp
+            import torch
         except ImportError:
             return
-        cp.get_default_memory_pool().free_all_blocks()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _validate_top_k(top_k: int) -> None:
@@ -485,11 +449,11 @@ class VectorIndex:
             return empty
         columns = min(top_k, candidates)
         if self._device == "cuda":
-            rows, cols, values = self._cupy_candidates(matrix, columns, positions)
+            rows, cols, values = self._torch_candidates(matrix, columns, positions)
             if rows.size == 0:
                 return empty
             return self._assemble(rows, cols, values, columns, matrix.shape[0])
-        if self._npy_path is not None:
+        if self._vector_source is not None:
             rows, cols, values = self._numpy_candidates(matrix, columns, positions)
             if rows.size == 0:
                 return empty
@@ -545,7 +509,11 @@ class VectorIndex:
         slower than one BLAS call per block.  Reading the blocks here keeps
         the KB on disk and the arithmetic in BLAS.
         """
-        source = np.load(self._npy_path, mmap_mode="r")
+        source = (
+            np.load(self._npy_path, mmap_mode="r")
+            if self._npy_path is not None
+            else self._vector_source
+        )
         n_rows = int(source.shape[0])
         dim = int(source.shape[1])
         n_queries = int(matrix.shape[0])
@@ -587,35 +555,39 @@ class VectorIndex:
             np.concatenate(values_out),
         )
 
-    def _cupy_candidates(
+    def _torch_candidates(
         self,
         matrix: np.ndarray,
         columns: int,
         positions: np.ndarray,
     ):
-        """GPU scan: index row blocks → VRAM → ``Q·Aᵀ`` with CuPy.
+        """GPU scan: index row blocks → VRAM → ``Q·Aᵀ`` with torch.
 
-        Block width follows the free VRAM CuPy reports, so neither the KB nor
-        the full score matrix is ever resident.  Returns the entries at or
-        above each block's k-th score, in global index coordinates.
+        Block width follows the free VRAM, so neither the KB nor the full
+        score matrix is ever resident.  Returns the entries at or above each
+        block's k-th score, in global index coordinates.
         """
-        import cupy as cp
+        import torch
 
-        if self._npy_path is not None:
-            source = np.load(self._npy_path, mmap_mode="r")
-        else:
-            source = self.vectors
+        source = (
+            np.load(self._npy_path, mmap_mode="r")
+            if self._npy_path is not None
+            else self._vector_source
+        )
         n_rows = int(source.shape[0])
         dim = int(source.shape[1])
         n_queries = int(matrix.shape[0])
         itemsize = np.dtype(np.float32).itemsize
         # A block costs its vectors, one score column per query, and the mask.
-        free, _ = cp.cuda.Device().mem_info
+        free, _ = torch.cuda.mem_get_info()
         per_row = dim * itemsize + n_queries * (itemsize + 1)
         block_rows = max(1, int(free) // 3 // per_row)
         filtered = int(positions.size) != n_rows
 
-        queries = cp.asarray(np.ascontiguousarray(matrix, dtype=np.float32))
+        target = torch.device("cuda")
+        queries = torch.tensor(
+            np.ascontiguousarray(matrix, dtype=np.float32), device=target
+        )
         rows_out: list[np.ndarray] = []
         cols_out: list[np.ndarray] = []
         values_out: list[np.ndarray] = []
@@ -626,23 +598,25 @@ class VectorIndex:
                 hi = int(np.searchsorted(positions, stop, side="left"))
                 if hi <= lo:
                     continue
-                scores = queries @ cp.asarray(source[start:stop]).T
+                scores = queries @ torch.tensor(source[start:stop], device=target).T
                 if filtered:
-                    scores = scores[:, cp.asarray(positions[lo:hi] - start)]
+                    scores = scores.index_select(
+                        1,
+                        torch.tensor(
+                            positions[lo:hi] - start, device=target
+                        ),
+                    )
                 width = hi - lo
                 kth = min(columns, width)
-                # cp.partition copies, so the block keeps its column order.
-                cutoff = cp.partition(scores, width - kth, axis=1)[
-                    :, width - kth
-                ]
-                rows, cols = cp.nonzero(scores >= cutoff[:, None])
-                rows_out.append(cp.asnumpy(rows))
-                cols_out.append(positions[lo:hi][cp.asnumpy(cols)])
-                values_out.append(cp.asnumpy(scores[rows, cols]))
+                cutoff = torch.kthvalue(scores, width - kth + 1, dim=1).values
+                rows, cols = (scores >= cutoff[:, None]).nonzero(as_tuple=True)
+                rows_out.append(rows.cpu().numpy())
+                cols_out.append(positions[lo:hi][cols.cpu().numpy()])
+                values_out.append(scores[rows, cols].cpu().numpy())
                 del scores
         finally:
             del queries
-            cp.get_default_memory_pool().free_all_blocks()
+            torch.cuda.empty_cache()
         if not rows_out:
             empty = np.empty(0, dtype=np.int64)
             return empty, empty.copy(), np.empty(0, dtype=np.float32)
@@ -731,10 +705,11 @@ class VectorIndex:
             raise ValueError(f"queries must be 2-D, got shape {matrix.shape!r}")
         if matrix.shape[0] == 0:
             return []
-        if matrix.shape[1] != self.vectors.shape[1]:
+        dimension = self._dimension()
+        if matrix.shape[1] != dimension:
             raise ValueError(
                 f"query dimension {matrix.shape[1]} does not match index "
-                f"dimension {self.vectors.shape[1]}"
+                f"dimension {dimension}"
             )
         if not np.all(np.isfinite(matrix)):
             raise ValueError("queries contain non-finite values")
@@ -762,9 +737,10 @@ class VectorIndex:
     # Persistence
     # ------------------------------------------------------------------
     def _as_numpy_vectors(self) -> np.ndarray:
-        """The vectors as a NumPy array; materialises a disk-backed KB."""
-        if isinstance(self.vectors, np.ndarray):
-            return self.vectors
+        """The vectors as a NumPy array (a memmap view for a loaded KB)."""
+        source = self._vector_source
+        if source is not None:
+            return source
         return pc.to_numpy(self.vectors, allow_huge=True)
 
     def save(self, directory) -> None:
@@ -774,7 +750,7 @@ class VectorIndex:
         np.save(base / "vectors.npy", self._as_numpy_vectors())
         meta = {
             "count": len(self),
-            "dim": int(self.vectors.shape[1]),
+            "dim": self._dimension(),
             "cuis": list(self.cuis),
             "surfaces": list(self.surfaces),
             "source_kbs": list(self.source_kbs),
@@ -797,7 +773,7 @@ class VectorIndex:
         meta = {
             "format": SINGLE_FILE_FORMAT,
             "count": len(self),
-            "dim": int(self.vectors.shape[1]),
+            "dim": self._dimension(),
             "encoder_info": self.encoder_info,
         }
         # Unicode arrays keep the artifact pickle-free; None -> "" for source_kb.
@@ -853,7 +829,7 @@ class VectorIndex:
                 )
 
         extracted = _extract_vectors(path, cache_dir)
-        vectors = _open_vectors(extracted, cache_dir)
+        vectors = np.load(extracted, mmap_mode="r")
         if vectors.shape[0] != len(cuis):
             raise ValueError(
                 f"{path}: meta count {meta.get('count')!r} disagrees with "
@@ -871,6 +847,7 @@ class VectorIndex:
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
+            file_backed=True,
         )
         index._npy_path = extracted
         return index
@@ -878,7 +855,7 @@ class VectorIndex:
     @classmethod
     def load(cls, directory) -> "VectorIndex":
         base = Path(directory)
-        vectors = _open_vectors(base / "vectors.npy")
+        vectors = np.load(base / "vectors.npy", mmap_mode="r")
         with (base / "meta.json").open("r", encoding="utf-8-sig") as handle:
             meta = json.load(handle)
 
@@ -926,6 +903,7 @@ class VectorIndex:
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
+            file_backed=True,
         )
         index._npy_path = base / "vectors.npy"
         return index

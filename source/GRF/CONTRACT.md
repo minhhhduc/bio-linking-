@@ -219,7 +219,7 @@ class VectorIndex:
     def search_batch(self, queries, top_k: int, *,
                      source_kb: str | None = None
                      ) -> list[list[RetrievalHit]]
-    def use_gpu(self, device: str = "cuda") -> None   # CuPy row-block scan
+    def use_gpu(self, device: str = "cuda") -> None   # torch row-block scan
     def release_gpu(self) -> None                     # stop CUDA scoring
     @property
     def search_device(self) -> str                    # "cuda" | "cpu"
@@ -234,14 +234,14 @@ Exact cosine scan (architecture permits exact). Deterministic ordering:
 score desc, then `cui`, then `surface`. Empty index -> `[]`, but query
 dimension is checked before the empty short-circuit. A loaded index keeps its
 `vectors.npy` as a memmap; `search_batch` reads index row blocks from it and
-computes `Q @ A_block^T` one block at a time (NumPy/BLAS on CPU, CuPy on GPU
+computes `Q @ A_block^T` one block at a time (NumPy/BLAS on CPU, torch on GPU
 when `use_gpu()` succeeded), keeping every entry at or above the block's k-th
 score. Neither the KB nor the full `(rows, N)` score matrix is materialised;
 block width follows the free device memory. `topk` runs on the returned
 candidates, so hits keep the same score/cui/surface tie-break. Scores can
 differ in the last float32 ULPs from BLAS reduce order.
-`use_gpu("cuda")` switches the scan to CuPy and requires an index that was
-loaded from an artifact (the memmap is what gets streamed); without CuPy or a
+`use_gpu("cuda")` switches the scan to torch and requires an index that was
+loaded from an artifact (the memmap is what gets streamed); without a
 CUDA device it raises and the notebooks stay on the CPU. `release_gpu()` stops
 GPU scoring. Save/load:
 `.npz` artifact; `load_npz` streams its `vectors.npy` member to a local cache

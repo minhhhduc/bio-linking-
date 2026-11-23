@@ -244,12 +244,11 @@ data loading, re-ranking) drives a `tqdm` bar through the library's
 does too (`baseline/ranking` installs neither — it uses no LLM).
 
 With `DEVICE = "cuda"`, `ranking.ipynb` and `baseline/ranking.ipynb` call
-`VectorIndex.use_gpu`, which scores with CuPy (the PyPI `pycauset` wheels have
+`VectorIndex.use_gpu`, which scores with torch (the PyPI `pycauset` wheels have
 no CUDA backend): index row blocks are streamed from the memory-mapped
 `vectors.npy` to VRAM, `Q @ A_block^T` runs there, and only the candidates at
-or above each block's k-th score come back. The notebook installs
-`cupy-cuda12x[ctk]`; without CuPy or a CUDA device `use_gpu()` raises and the
-scan stays on the CPU.
+or above each block's k-th score come back. Nothing extra is installed; without
+a CUDA device `use_gpu()` raises and the scan stays on the CPU.
 
 **The LLM and the index never share a card.** `feedback.ipynb` generates every
 mention's feedback, unloads the model and empties the CUDA cache; it loads no

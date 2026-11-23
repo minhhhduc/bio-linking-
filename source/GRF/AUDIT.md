@@ -146,7 +146,7 @@ the stale claims.
   path is only exercised by an external KB. The paper's 8 datasets and Tables
   1–3 cannot be reproduced from the local data.
 - **Scale and cache bounds:** retrieval is an exact cosine scan over the memory-mapped
-  index, one row block at a time (NumPy/BLAS on CPU, CuPy on GPU); the feedback cache is
+  index, one row block at a time (NumPy/BLAS on CPU, torch on GPU); the feedback cache is
   an unbounded in-process dictionary. Both are acceptable for the reference-scale
   experiments but are not a production retrieval design.
 - **No runtime validation:** behavior is reasoned statically. No tests are
