@@ -333,6 +333,17 @@ class VectorIndex:
             raise RuntimeError(
                 "device='cuda' but CuPy sees no CUDA device; use the CPU path"
             ) from exc
+        try:
+            # A 2x2 product loads the CUDA runtime and cuBLAS now, where the
+            # caller can catch RuntimeError and fall back, instead of in the
+            # middle of a scan ("libcublas.so.12: cannot open shared object").
+            probe = cp.zeros((2, 2), dtype=cp.float32)
+            probe @ probe
+        except Exception as exc:  # noqa: BLE001 - missing CUDA libraries
+            raise RuntimeError(
+                "device='cuda' but CuPy cannot multiply on this runtime "
+                f"({exc}); install cupy-cuda12x[all] or use the CPU path"
+            ) from exc
         if self._npy_path is None and not isinstance(self.vectors, np.ndarray):
             raise RuntimeError(
                 "device='cuda' needs the raw rows; load the index from an "
