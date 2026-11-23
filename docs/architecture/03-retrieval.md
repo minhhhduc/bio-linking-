@@ -34,13 +34,12 @@ Nạp index **không** đọc cả KB vào RAM:
 1. `VectorIndex.load_npz(path, cache_dir=...)` stream member `vectors.npy` từ
    file `.npz` (zip) ra một thư mục cache **local** — `zipfile` + `copyfileobj`
    theo block, không `np.load` cả mảng.
-2. `np.load(cache/vectors.npy, mmap_mode="r")` — chỉ mở mmap, **không** copy.
-   Ma trận `pycauset` chỉ được dựng khi thật sự cần (đường CPU hoặc `save`),
-   qua `pycauset.matrix(..., max_in_ram_bytes=512 MiB)`: pycauset ghi payload
-   vào một **backing file** trên đĩa nên không cấp phát $N \times d$ float
-   trong heap. `np.load` thường (hay `pycauset.load_npy`, vốn `np.load` rồi
-   copy) nạp cả mảng vào RAM và bị `MemoryGovernor` từ chối khi KB lớn hơn
-   RAM trống; đường GPU dùng thẳng memmap nên không dựng pycauset.
+2. `np.load(cache/vectors.npy, mmap_mode="r")` rồi
+   `pycauset.matrix(..., max_in_ram_bytes=512 MiB)`: pycauset ghi payload vào
+   một **backing file** trên đĩa và ma trận chỉ trỏ tới file đó, nên không cấp
+   phát $N \times d$ float trong heap. `np.load` thường (hay `pycauset.load_npy`,
+   vốn `np.load` rồi copy) nạp cả mảng vào RAM và bị `MemoryGovernor` từ chối
+   khi KB lớn hơn RAM trống.
 3. Metadata (`cuis`, `surfaces`, `source_kbs`, `encoder_info`) đọc từ `meta`.
 
 Cache được đặt tên theo `(kích thước, mtime)` của file `.npz`, nên build lại KB
@@ -81,15 +80,9 @@ S_{\text{chunk}} &= Q_{\text{chunk}} \cdot A^\top \in \mathbb{R}^{c \times N} \\
 \text{top-}k(S_{\text{chunk}}[i, :]) &\to \{(a, s_{ia})\}_{a \in \text{Top-}k}
 \end{aligned}$$
 
-- Kích thước block điểm: `_score_block_bytes()` = $\lceil$`MemAvailable`$/6\rceil$,
-  kẹp trong 256 MiB..8 GiB; số query mỗi chunk = `block_bytes // 4 // N`. Mỗi
-  chunk là **một lượt quét toàn index**, nên block càng rộng càng ít lượt:
-  959 query trên index 3M hàng, 256 MiB cần ~11 lượt, 4 GiB chỉ ~2.
-- Trong lúc quét, ngưỡng RAM của `pycauset` được nâng lên đúng cỡ block rồi trả
-  lại trong `finally`: block nằm trong RAM thay vì spill ra backing file rồi
-  đọc lại để top-k.
-- Không chia phía index được: `pycauset` từ chối matmul trên view có offset
-  (`matmul on views with offsets is not supported`), nên chỉ query mới cắt được.
+- Số query mỗi chunk: `min(_QUERY_CHUNK=256, _SCORE_BUDGET // N)` với
+  `_SCORE_BUDGET = 2^26` float32 (≈256 MiB) — block điểm không phình theo kích
+  thước index lẫn batch.
 - Top-k dùng `np.partition` trên **bản copy** của block: giữ nguyên thứ tự cột,
   nên cột vẫn trỏ đúng hàng index; mọi entry bằng điểm cắt được giữ, để tie-break
   theo `(-score, cui, surface)` thay vì theo thứ tự partition.
@@ -98,15 +91,9 @@ S_{\text{chunk}} &= Q_{\text{chunk}} \cdot A^\top \in \mathbb{R}^{c \times N} \\
 
 ## 5. GPU
 
-`index.use_gpu("cuda")` chấm điểm bằng `torch` — wheel `pycauset` trên PyPI là
-bản CPU, không có backend CUDA. Từng **block hàng** của index được copy lên
-VRAM, `Q · A_blockᵀ` chạy trên GPU, và chỉ các entry ≥ ngưỡng k-th của block
-được trả về CPU; KB không bao giờ nằm trọn trong VRAM.
-
-Cỡ block chọn theo VRAM trống (`torch.cuda.mem_get_info`): một hàng index tốn
-`4·d` byte vector + `5` byte mỗi query (điểm + mask), block ≈ 50% VRAM trống,
-query chunk phần còn lại. Bản `pycauset` tự build có CUDA được dùng làm
-fallback (`pycauset.cuda.enable()`).
+`index.use_gpu("cuda")` gọi `pycauset.cuda.enable()`; `pycauset` tự route phép
+nhân sang thiết bị. Không còn bản copy `torch` của toàn bộ KB trong VRAM/RAM —
+ma trận vẫn file-backed, chỉ chunk truy vấn và block điểm đi qua thiết bị.
 
 Notebook bọc lời gọi trong `try/except RuntimeError` và rơi về CPU nếu bản
 `pycauset` không có CUDA; `index.search_device` cho biết đang chạy ở đâu.
@@ -147,33 +134,3 @@ $$ \text{Candidates} = \text{argsort}_{c} \big( -\text{Score}(c), c \big)[:k_{\t
 
 Trả về danh sách `(cui, score, surface_rep)` đã sắp xếp; đây là đầu vào của
 re-ranker (stage riêng biệt, không thuộc retrieval).
-
-## 9. Đường out-of-core: đĩa → RAM → VRAM
-
-```text
-  Đĩa (local)                       RAM                        GPU (VRAM)
-  ┌───────────────────┐   block    ┌──────────────┐   PCIe   ┌────────────────┐
-  │ vectors.npy (mmap)│ ─────────▶ │  A_block     │ ───────▶ │   A_block      │
-  │ N × d, float32    │  prefetch  │  (b × d view)│          │  Q · A_blockᵀ  │
-  └───────────────────┘            └──────────────┘          └───────┬────────┘
-                                                                     │ k-th
-       chỉ entry ≥ ngưỡng k-th của block về CPU  ◀───────────────────┘
-```
-
-| Sơ đồ tham chiếu | Ở đây |
-| --- | --- |
-| Zarr chunks trên SSD | `vectors.npy` + `np.load(mmap_mode="r")`: chunk theo **hàng**, không nén, mmap sẵn |
-| Dask scheduling + prefetch block | vòng lặp block trong `VectorIndex._search_torch`; page cache của OS lo prefetch |
-| CuPy trên VRAM | `torch` cùng vai trò (`torch.matmul`, `torch.kthvalue`) |
-| Ghi kết quả về đĩa | không cần: mỗi query chỉ giữ `k` entry, block điểm giải phóng ngay sau khi cắt |
-
-Bất biến: **không bước nào giữ toàn bộ KB**. `load_npz` chỉ mở `.npy` bằng
-mmap (không copy), `len(index)`/shape đọc từ memmap, đường GPU đọc từng block
-rồi chuyển sang VRAM, đường CPU mới dựng ma trận `pycauset` file-backed và
-cũng chỉ trả về block điểm.
-
-Không dùng Zarr/Dask/CuPy: mmap đã cho chunk theo hàng đúng thứ tự truy vấn,
-lịch block là một vòng lặp tuyến tính (Dask không thêm gì), và `torch` đã có
-mặt cho encoder — thêm ba dependency không đổi khả năng. `pycauset` là cùng ý
-tưởng ở tầng thấp hơn nhưng trả về nguyên block điểm, nên phía gọi vẫn phải
-cắt query (§4).

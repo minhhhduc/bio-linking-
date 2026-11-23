@@ -3,7 +3,7 @@
 See ``README.md`` for the mapping between components, reference equations and
 modules.  ``sentence-transformers`` is imported lazily by
 :class:`GRF.encoder.SentenceTransformerEncoder`, so importing this
-package needs only numpy and pycauset; torch is optional (GPU scoring).
+package needs only numpy and pycauset.
 """
 
 from .aggregation import aggregate_hits, concept_rank_list
