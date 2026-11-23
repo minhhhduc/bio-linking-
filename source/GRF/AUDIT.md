@@ -12,7 +12,7 @@ those mentions describe the tree at audit time.
 
 ## Sources used
 
-- `docs/architecture.md`: C1–C9, data contracts §4, pipelines §5, prompts §6,
+- `docs/architecture/`: C1–C9, data contracts §4, pipelines §5, prompts §6,
   fusion §7, re-ranking §8, parameters §9, metrics §10, degradation §11.
 - `paper/reference_abstract.md`: problem statement, homonym rule §3, prompts
   §4, pipelines §5, non-reproducible empirical tables §6.
@@ -145,8 +145,8 @@ the stale claims.
   mentions. No surface in this file maps to more than one CUI, so the homonym
   path is only exercised by an external KB. The paper's 8 datasets and Tables
   1–3 cannot be reproduced from the local data.
-- **Scale and cache bounds:** retrieval is an exact cosine scan (numpy on CPU,
-  or an opt-in PyTorch GPU copy); the feedback cache is an unbounded in-process
+- **Scale and cache bounds:** retrieval is an exact cosine scan (`pycauset.matmul` over a
+  memory-mapped index, CPU or opt-in CUDA); the feedback cache is an unbounded in-process
   dictionary. Both are acceptable for the reference-scale experiments but are
   not a production retrieval design.
 - **No runtime validation:** behavior is reasoned statically. No tests are
@@ -156,7 +156,7 @@ the stale claims.
   context undefined, so a hung model stalls the feedback stage instead of
   degrading. The feedback model is a CUDA resident, so the GRF run is split at
   that phase: `feedback.ipynb` holds only the LLM, `ranking.ipynb` holds only
-  the SapBERT encoder and the index's GPU copy, and the handoff between them is
+  the SapBERT encoder and the memory-mapped index, and the handoff between them is
   a file (`grf-feedback-v1`). Inside one notebook the two never coexist. An
   out-of-memory load still degrades to per-kind feedback failures (silent `Q_0`
   fallback) rather than a crash, recorded in the bundle. On a 16 GB Colab GPU

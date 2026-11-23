@@ -1,7 +1,7 @@
 """OpenAI-compatible chat completion client using only the standard library.
 
 The pipeline deliberately has no retry logic: a failed feedback or re-rank
-call degrades to the baseline path (see ``docs/architecture.md`` §6).
+call degrades to the baseline path (see ``docs/architecture/04-feedback.md`` §6).
 """
 
 from __future__ import annotations

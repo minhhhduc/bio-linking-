@@ -1,6 +1,6 @@
 # GRF — Biomedical Entity Linking
 
-Implementation of the methods in [`docs/architecture.md`](../../docs/architecture.md)
+Implementation of the methods in [`docs/architecture/README.md`](../../docs/architecture/README.md)
 and [`paper/reference_abstract.md`](../../paper/reference_abstract.md). No
 pipeline code in this package was executed during implementation; no empirical
 results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
@@ -12,7 +12,7 @@ results are claimed. The static audit record is in [`AUDIT.md`](AUDIT.md).
 | C1 | KB loader/parser → `Concept(cui, name, aliases)` | `common/kb.py` (`load_concepts_jsonl`, `load_concepts_csv`, `concepts_from_dataset`) | §2 |
 | C2 | Homonym rewriting `a + " (" + N_c + ")"` | `common/kb.py` (`surface_entries`) | §3 |
 | C3 | Encoder `E(·)` (BioSyn/SapBERT) | `common/encoder.py` | §3, §5 |
-| C4 | Exact cosine vector index, one entry per surface form; directory (`save`/`load`) or single-file `.npz` (`save_npz`/`load_npz`) persistence | `common/index.py` | §3, §4.2, §5.1 |
+| C4 | Exact cosine vector index, one entry per surface form; single-file `.npz` artifact whose `vectors.npy` member is extracted locally and memory-mapped; scoring via `pycauset.matmul` | `common/index.py` | §3, §4.2, §5.1 |
 | C5 | Feedback generation (`def`, `syn`, `std`) + cache + fallback | `feedback.py`; prompt text in `prompts.yaml` (loaded by `prompts.py`); clients in `llm.py` (API) and `hf_llm.py` (local transformers) | §4, §6 |
 | C6 | Vector interpolation / weighted RRF | `fusion.py` | §5, §7 |
 | C7 | Concept aggregation `max` over aliases | `common/aggregation.py` | §7.3 |
@@ -239,18 +239,19 @@ The GRF run is split at the feedback phase, and the split is a file:
 
 Every long stage (KB parsing, embedding, retrieval, candidate save/reload, gold
 data loading, re-ranking) drives a `tqdm` bar through the library's
-`progress_callback`; all five notebooks install `tqdm` explicitly,
+`progress_callback`; all five notebooks install `tqdm` and `pycauset` explicitly,
 `feedback` installs `transformers` for the local LLM backend, and `reranking`
 does too (`baseline/ranking` installs neither — it uses no LLM).
 
-With `DEVICE = "cuda"`, `ranking.ipynb` and `baseline/ranking.ipynb` keep one
-GPU copy of the index (`VectorIndex.use_gpu`) and scores queries with a batched
-matrix multiply; only rows at or above each k-th score return to CPU. If the
-copy does not fit, it logs a warning and uses the CPU scan.
+With `DEVICE = "cuda"`, `ranking.ipynb` and `baseline/ranking.ipynb` call
+`VectorIndex.use_gpu`, which routes `pycauset.matmul` to the GPU; the index
+stays memory-mapped on disk and only each query chunk and its score block cross
+to the device. If the build has no CUDA backend, it logs a warning and uses the
+CPU scan.
 
 **The LLM and the index never share a card.** `feedback.ipynb` generates every
 mention's feedback, unloads the model and empties the CUDA cache; it loads no
-encoder and no index. `ranking.ipynb` then takes the index's GPU copy and runs
+encoder and no index. `ranking.ipynb` then enables CUDA routing for the index and runs
 `link_batch(..., feedback_outcomes=...)`, which replays the bundle through the
 encoding, retrieval and ranking phases. No single process ever holds the
 feedback weights and the vector copy at the same time.

@@ -1,6 +1,6 @@
 """Frozen data types shared across the pipeline.
 
-Field definitions mirror ``docs/architecture.md`` §4 (data contracts) and
+Field definitions mirror ``docs/architecture/01-data-contracts.md`` §4 (data contracts) and
 ``paper/reference_abstract.md`` §2/§3.  These objects are intentionally dumb:
 validation that depends on pipeline configuration lives in :mod:`config`.
 """

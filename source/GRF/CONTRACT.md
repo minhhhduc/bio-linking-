@@ -1,7 +1,7 @@
 # Implementation contract — GRF
 
 Frozen interfaces for parallel implementation. Derived from
-`docs/architecture.md` and `paper/reference_abstract.md`. Do not change a
+`docs/architecture/README.md` and `paper/reference_abstract.md`. Do not change a
 signature here without coordinating; other modules import it.
 
 Package roots: `source/common/` (shared encoder, index, KB/gold loaders,
@@ -219,29 +219,30 @@ class VectorIndex:
     def search_batch(self, queries, top_k: int, *,
                      source_kb: str | None = None
                      ) -> list[list[RetrievalHit]]
-    def use_gpu(self, device: str = "cuda") -> None   # lazy torch import
-    def release_gpu(self) -> None                     # drop device copy
+    def use_gpu(self, device: str = "cuda") -> None   # pycauset CUDA routing
+    def release_gpu(self) -> None                     # stop CUDA routing
     @property
     def search_device(self) -> str                    # "cuda" | "cpu"
     def save(self, directory) -> None
     def load(self, directory) -> "VectorIndex"     # classmethod
     def save_npz(self, path) -> None                # one .npz, no pickle
-    def load_npz(self, path) -> "VectorIndex"       # classmethod
+    def load_npz(self, path, *, cache_dir=None) -> "VectorIndex"  # classmethod
     def __len__(self) -> int
 ```
 
 Exact cosine scan (architecture permits exact). Deterministic ordering:
 score desc, then `cui`, then `surface`. Empty index -> `[]`, but query
 dimension is checked before the empty short-circuit. `search_batch` scores all
-rows with one matrix multiply `Q @ A^T`, chunked on the GPU to bound the
-transient `(N, queries)` score matrix; the chunk size shrinks automatically on
-large indexes (256 MiB score budget). With `use_gpu()` the vectors live on CUDA,
-`topk` runs per query column on the device, and only those k hits cross back to
-CPU for the same score/cui/surface tie-break. The ordering rule matches the CPU
-path; scores can
-differ in the last float32 ULPs because cuBLAS and BLAS reduce differently.
-PyTorch is imported lazily and stays optional; `release_gpu()` clears the device
-copy and cached CUDA memory. Save/load:
+rows with one `pycauset.matmul` (`Q @ A^T`) against the memory-mapped index,
+chunked to bound the transient `(rows, N)` score matrix; the chunk size shrinks
+automatically on large indexes (256 MiB score budget). `topk` runs in NumPy on
+the returned block, so hits keep the same score/cui/surface tie-break. The
+ordering rule matches the CPU path; scores can
+differ in the last float32 ULPs because the backend and BLAS reduce differently.
+`use_gpu()` enables `pycauset.cuda`, which routes the matmul to the device while
+the index stays file-backed; `release_gpu()` stops the routing. Save/load:
+`.npz` artifact; `load_npz` streams its `vectors.npy` member to a local cache
+(keyed by size/mtime) and memory-maps it. The directory form is
 `vectors.npy` + `meta.json` (no pickle); `encoder_info` is optional metadata
 (`{"encoder": ..., "model": ...}`) and older files without it load with
 `encoder_info=None`. Raise `ValueError` on shape/length mismatch, string passed
@@ -430,7 +431,7 @@ exactly like a failed API call. The class is not a GPU-free operation: a local
 model is a CUDA resident, which matters on a Colab-sized device — the GRF run is
 therefore split into two notebooks, and `feedback.run_feedback_batch` (what
 `EntityLinker.feedback_batch` delegates to) exists so the model is freed before
-the encoder and the index's GPU copy load.
+the encoder and the memory-mapped index load.
 
 Prompt template exactly: `feedback.envelope` rendered with the context, the
 mention and the instruction. Instruction texts are English, live in
@@ -551,8 +552,8 @@ def evaluate_by_label(linker, samples) -> dict[str | None, Metrics]
 accepts as `feedback_outcomes`; it delegates to
 `feedback.run_feedback_batch`, which is the same phase without a linker. The GRF
 notebooks use the split directly: `feedback.ipynb` generates every mention's
-feedback and unloads the LLM, `ranking.ipynb` loads the encoder and the index's
-GPU copy and replays the bundle — the feedback phase is the only one that needs
+feedback and unloads the LLM, `ranking.ipynb` loads the encoder and the memory-mapped
+index and replays the bundle — the feedback phase is the only one that needs
 no encoder at all, and on a large feedback model the two sets of weights do not
 fit side by side. `link_batch(..., feedback_outcomes=...)` replays that list and
 skips phase 2, so the `"feedback"` phase is not reported a second time; the list
