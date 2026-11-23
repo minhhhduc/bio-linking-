@@ -109,13 +109,24 @@ def _open_vectors(path: Path, backing_dir=None):
     )
 
 
+_MIN_SCORE_ELEMS = 1 << 26   # 256 MiB of float32
+
+
+def _score_block_elems() -> int:
+    """Float32 elements in one (queries x index) score block.
+
+    Every chunk is a full scan of the index, so the chunk should be as wide
+    as RAM allows: at 256 MiB a 1.5M-row KB needs ~20 passes, at 1 GiB only
+    ~4.  The block is tied to pycauset's in-RAM threshold -- above it each
+    block is written to a backing file and read back before top-k, which
+    costs more than the pass it saves.
+    """
+    threshold = pc.get_memory_threshold() or (1 << 30)
+    return max(_MIN_SCORE_ELEMS, int(threshold) // 4)
+
+
 class VectorIndex:
     """One entry per KB surface form; exact cosine scan at query time."""
-
-    # Queries per matmul, capped so the chunk's (rows, N) score block stays
-    # around 256 MiB of float32 whatever the index size (T4-friendly).
-    _QUERY_CHUNK = 256
-    _SCORE_BUDGET = 1 << 26
 
     def __init__(
         self,
@@ -391,9 +402,7 @@ class VectorIndex:
         if candidates == 0:
             return empty
         columns = min(top_k, candidates)
-        chunk_rows = max(
-            1, min(self._QUERY_CHUNK, self._SCORE_BUDGET // count)
-        )
+        chunk_rows = max(1, _score_block_elems() // count)
         results: list[list[RetrievalHit]] = []
         for start in range(0, matrix.shape[0], chunk_rows):
             chunk = matrix[start : start + chunk_rows]
