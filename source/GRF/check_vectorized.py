@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pycauset as pc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -91,7 +92,7 @@ def check_index() -> None:
 
     for label, index in cases.items():
         for top_k in ((1, 10, 50) if label == "top_k>size" else (1, 10)):
-            scores = unit_queries @ index.vectors.T
+            scores = unit_queries @ pc.to_numpy(index.vectors, allow_huge=True).T
             sources = index.source_kbs if index.source_kbs is not None else [None]
             for source_kb in (None, *sorted({s for s in sources if s is not None})):
                 eligible = (

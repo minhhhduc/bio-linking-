@@ -1,4 +1,6 @@
 numpy>=1.24
+# Exact cosine matmul and the memory-mapped KB (architecture C4).
+pycauset>=0.6.1
 # Prompt templates are data (GRF/prompts.yaml), read by GRF/prompts.py.
 pyyaml>=6.0
 # Required only by SentenceTransformerEncoder (BioSyn/SapBERT checkpoints).

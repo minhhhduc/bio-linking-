@@ -1,19 +1,29 @@
 """C4: exact cosine vector index over KB surface forms.
 
 Vectors are stored L2-normalised as float32, so a dot product is cosine
-similarity. Persistence is either ``vectors.npy`` + ``meta.json``
-(:meth:`VectorIndex.save`/:meth:`VectorIndex.load`) or a single ``.npz`` file
-(:meth:`VectorIndex.save_npz`/:meth:`VectorIndex.load_npz`); neither uses pickle.
+similarity.  The index is a ``pycauset`` matrix: persisted as a single
+``.npz`` file (:meth:`VectorIndex.save_npz`) but **loaded** by streaming its
+``vectors.npy`` member to local disk and memory-mapping it
+(:meth:`VectorIndex.load_npz`), so the KB is never held whole in RAM.  Scoring
+is ``pycauset.matmul`` over that disk-backed matrix; top-k stays in NumPy
+(``pycauset`` has no ``topk``).  A directory form (``vectors.npy`` +
+``meta.json``, :meth:`VectorIndex.save`/:meth:`VectorIndex.load`) is still
+supported; neither form uses pickle.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
+import zipfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
+import pycauset as pc
 
 from .kb import surface_entries
 from .schemas import Concept, RetrievalHit
@@ -47,28 +57,62 @@ def as_unit_rows(matrix: np.ndarray) -> np.ndarray:
     return scaled
 
 
+def _extract_vectors(path: Path, cache_dir) -> Path:
+    """Stream the ``vectors.npy`` member of an ``.npz`` artifact to local disk.
+
+    ``np.load`` on an ``.npz`` decompresses members in RAM; ``pycauset`` can
+    only memory-map a plain ``.npy``.  Copying the zip member block by block
+    gives that file without ever holding the whole array in the heap.  The
+    directory is keyed by the artifact's size and mtime, so rebuilding the KB
+    re-extracts instead of silently scoring against stale vectors.
+    """
+    stat = path.stat()
+    root = (
+        Path(cache_dir)
+        if cache_dir is not None
+        else Path(tempfile.gettempdir()) / "grf_kb_npy"
+    )
+    target = root / f"{path.stem}-{stat.st_size}-{stat.st_mtime_ns}" / "vectors.npy"
+    if target.exists():
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # A unique staging name: two notebooks may load the same artifact at once.
+    staging = target.with_name(f"vectors.npy.{os.getpid()}.tmp")
+    with zipfile.ZipFile(path) as archive:
+        if "vectors.npy" not in archive.namelist():
+            raise ValueError(f"{path}: npz artifact has no 'vectors.npy' member")
+        with archive.open("vectors.npy") as source, staging.open("wb") as sink:
+            shutil.copyfileobj(source, sink, length=1 << 20)
+    staging.replace(target)
+    return target
+
+
 class VectorIndex:
     """One entry per KB surface form; exact cosine scan at query time."""
 
-    # Bounds the transient (N, queries) score matrix on the GPU.
-    # Queries per device matmul, capped so the chunk's score matrix stays
+    # Queries per matmul, capped so the chunk's (rows, N) score block stays
     # around 256 MiB of float32 whatever the index size (T4-friendly).
-    _GPU_QUERY_CHUNK = 256
-    _GPU_SCORE_BUDGET = 1 << 26
-    # Same idea for the CPU path: floats of the (rows, N) score block.
-    _CPU_SCORE_BUDGET = 1 << 25
+    _QUERY_CHUNK = 256
+    _SCORE_BUDGET = 1 << 26
 
     def __init__(
         self,
-        vectors: np.ndarray,
+        vectors,
         cuis: Sequence[str],
         surfaces: Sequence[str],
         source_kbs: Sequence[str | None] | None = None,
         *,
         encoder_info: Mapping[str, str] | None = None,
     ) -> None:
-        array = np.array(vectors, dtype=np.float32, copy=True)
-        if array.ndim != 2:
+        # A loaded artifact arrives as a disk-backed ``pycauset`` matrix: it is
+        # already L2-normalised (the writer normalised it once), so it must not
+        # be copied through a NumPy array — that would put the whole KB in RAM.
+        if isinstance(vectors, np.ndarray):
+            array = np.array(vectors, dtype=np.float32, copy=True)
+        else:
+            array = vectors
+        if len(array.shape) != 2:
             raise ValueError(f"vectors must be 2-D, got shape {array.shape!r}")
         if array.shape[1] < 1:
             raise ValueError("vectors must have at least one embedding dimension")
@@ -82,7 +126,7 @@ class VectorIndex:
 
         cuis = tuple(cuis)
         surfaces = tuple(surfaces)
-        count = array.shape[0]
+        count = int(array.shape[0])
         if not (len(cuis) == len(surfaces) == count):
             raise ValueError(
                 "vectors, cuis and surfaces must have equal length "
@@ -130,24 +174,28 @@ class VectorIndex:
                 "duplicate surface entries waste Top-k slots"
             )
 
-        if not np.all(np.isfinite(array)):
-            raise ValueError("vectors contain non-finite values")
-        if count:
-            norms = np.linalg.norm(array, axis=1, keepdims=True)
-            if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
-                raise ValueError("vectors contain a zero-norm row")
-            # Rows that arrive unit-length (``encoder.encode`` normalises them
-            # once) are stored as given; only a raw row is scaled, and then
-            # exactly once.
-            array = as_unit_rows(array)
+        if isinstance(array, np.ndarray):
+            if not np.all(np.isfinite(array)):
+                raise ValueError("vectors contain non-finite values")
+            if count:
+                norms = np.linalg.norm(array, axis=1, keepdims=True)
+                if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
+                    raise ValueError("vectors contain a zero-norm row")
+                # Rows that arrive unit-length (``encoder.encode`` normalises
+                # them once) are stored as given; only a raw row is scaled, and
+                # then exactly once.
+                array = as_unit_rows(array)
+            # One copy into ``pycauset`` storage so the scan is a single
+            # ``pycauset.matmul`` against a matrix the backend owns.
+            self.vectors = pc.matrix(array) if count else array
+        else:
+            self.vectors = array
 
-        self.vectors = array.astype(np.float32, copy=False)
         self.cuis = cuis
         self.surfaces = surfaces
         self.source_kbs = source_kbs
         self.encoder_info = encoder_info
         self._device: str | None = None
-        self._gpu_vectors = None
 
     @classmethod
     def from_concepts(
@@ -230,48 +278,37 @@ class VectorIndex:
     # ------------------------------------------------------------------
     @property
     def search_device(self) -> str:
-        """``"cuda"`` when the vectors are cached on the GPU, else ``"cpu"``."""
+        """``"cuda"`` when ``pycauset`` is routing matmuls to the GPU."""
         return self._device or "cpu"
 
     def use_gpu(self, device: str = "cuda") -> None:
-        """Keep a device copy of the vectors for exact cosine scans.
+        """Route ``pycauset.matmul`` to the GPU.
 
-        PyTorch is imported lazily (it ships with sentence-transformers), so
-        the CPU path never needs it. ``device="cpu"`` releases the GPU copy.
+        The index stays file-backed: only the query chunk and its score block
+        cross to the device, so enabling CUDA does not copy the KB into VRAM.
         """
         if device == "cpu":
             self.release_gpu()
             return
         if device != "cuda":
             raise ValueError("device must be 'cuda' or 'cpu'")
-        if self._device == device and self._gpu_vectors is not None:
+        if self._device == device:
             return
-        try:
-            import torch
-        except ImportError as exc:
+        if not pc.cuda.is_available():
             raise RuntimeError(
-                "GPU search needs PyTorch; install sentence-transformers or torch."
-            ) from exc
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "device='cuda' but CUDA is not available; use the CPU path "
-                "or enable a GPU runtime."
+                "device='cuda' but this pycauset build has no CUDA backend; "
+                "use the CPU path or install a CUDA-enabled build."
             )
-        self._gpu_vectors = torch.from_numpy(
-            np.ascontiguousarray(self.vectors)
-        ).to(device)
+        pc.cuda.enable()
         self._device = device
 
     def release_gpu(self) -> None:
-        """Drop the device copy and return its cached memory to the driver."""
-        self._gpu_vectors = None
+        """Stop routing matmuls to the GPU and release device memory."""
         self._device = None
         try:
-            import torch
-        except ImportError:
-            return
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            pc.cuda.disable()
+        except Exception:  # noqa: BLE001 - a CPU build has nothing to release
+            pass
 
     @staticmethod
     def _validate_top_k(top_k: int) -> None:
@@ -289,13 +326,13 @@ class VectorIndex:
         ):
             raise ValueError("source_kb must be None or a non-empty string")
 
-    def _search_cpu(
+    def _search(
         self,
         matrix: np.ndarray,
         top_k: int,
         source_kb: str | None,
     ) -> list[list[RetrievalHit]]:
-        """Exact cosine scan on CPU: one matmul per query chunk, no row loop.
+        """Exact cosine scan: one ``pycauset.matmul`` per query chunk.
 
         The score block is ``S = Q · Aᵀ`` (both sides unit-norm).  The k-th
         score of every row is found with a partition **on a copy**, so the
@@ -334,13 +371,18 @@ class VectorIndex:
             return empty
         columns = min(top_k, candidates)
         chunk_rows = max(
-            1, min(self._GPU_QUERY_CHUNK, self._CPU_SCORE_BUDGET // count)
+            1, min(self._QUERY_CHUNK, self._SCORE_BUDGET // count)
         )
         results: list[list[RetrievalHit]] = []
         for start in range(0, matrix.shape[0], chunk_rows):
             chunk = matrix[start : start + chunk_rows]
             # One matrix multiply over the whole index, as the contract says.
-            scores = chunk @ self.vectors.T
+            # ``index.vectors.T`` is a metadata-only view of the memory-mapped
+            # KB; the (rows, N) result is a bounded in-RAM block.
+            scores = pc.to_numpy(
+                pc.matmul(pc.matrix(chunk), self.vectors.T),
+                allow_huge=True,
+            )
             # The source_kb filter only selects columns of that same score
             # block, so a filtered and an unfiltered search score the same
             # row identically.
@@ -429,10 +471,10 @@ class VectorIndex:
         Scores are one matrix product, ``R = queries @ self.vectors.T`` (both
         sides are unit-norm, so the product is cosine), then top-k along each
         row; the batch is chunked so the ``(rows, N)`` block stays bounded.
-        The ordering rule is identical to calling :meth:`search` per row.  With
-        :meth:`use_gpu` active, the product and ``topk`` run on the device in
-        query chunks and only rows at or above each k-th score are copied back
-        to CPU; float32 scores can differ in the last ULPs from the CPU path.
+        The product is ``pycauset.matmul`` over the memory-mapped index; top-k
+        runs in NumPy on that block.  The ordering rule is identical to
+        calling :meth:`search` per row; float32 scores can differ in the last
+        ULPs from BLAS.
 
         Query rows that are already unit-length are scored **as given**: the
         fusion normalises ``Q_GRF`` once after the weighted sum, and scaling it
@@ -456,115 +498,7 @@ class VectorIndex:
         if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
             raise ValueError("every query must have a non-zero norm")
         matrix = as_unit_rows(matrix)
-        if self._device is not None:
-            return self._search_gpu(matrix, top_k, source_kb)
-        return self._search_cpu(matrix, top_k, source_kb)
-
-    def _search_gpu(
-        self,
-        matrix: np.ndarray,
-        top_k: int,
-        source_kb: str | None,
-    ) -> list[list[RetrievalHit]]:
-        import torch
-
-        empty: list[list[RetrievalHit]] = [[] for _ in range(matrix.shape[0])]
-        if len(self) == 0:
-            return empty
-        if source_kb is None:
-            positions: list[int] | None = None
-            candidate_count = len(self)
-        else:
-            positions = [
-                i for i, kb_name in enumerate(self.source_kbs)
-                if kb_name == source_kb
-            ]
-            if not positions:
-                return empty
-            candidate_count = len(positions)
-
-        device = self._device
-        columns = min(top_k, candidate_count)
-        positions_cpu: np.ndarray | None = (
-            None if positions is None else np.asarray(positions, dtype=np.int64)
-        )
-        rows = (
-            None
-            if positions is None
-            else torch.tensor(positions, dtype=torch.long, device=device)
-        )
-
-        chunk_rows = max(
-            1, min(self._GPU_QUERY_CHUNK, self._GPU_SCORE_BUDGET // candidate_count)
-        )
-        results: list[list[RetrievalHit]] = []
-        for start in range(0, matrix.shape[0], chunk_rows):
-            chunk = matrix[start : start + chunk_rows]
-            with torch.no_grad():
-                queries = torch.from_numpy(
-                    np.ascontiguousarray(chunk)
-                ).to(device)
-                # ``search_batch`` already made every row unit-length (and left
-                # the ones that arrived unit untouched), so no rescaling here:
-                # a unit row's dot product with a unit index row is the cosine.
-                scores = self._gpu_vectors @ queries.T
-                if rows is not None:
-                    scores = scores.index_select(0, rows)
-
-                # top-k per query column on the device, then one vectorised
-                # tie-break (score desc, cui, surface) on the k hits of every
-                # column. Scores can differ in the last float32 ULPs from BLAS,
-                # but the ordering rule is the same as the CPU path.
-                values, indices = torch.topk(scores, k=columns, dim=0)
-                values = values.cpu().numpy()
-                indices = indices.cpu().numpy()
-                if positions_cpu is not None:
-                    indices = positions_cpu[indices]
-                ordered_indices, ordered_values = self._order_topk(indices, values)
-                results.extend(self._hits(ordered_indices, ordered_values))
-        return results
-
-    def _order_topk(
-        self, indices: np.ndarray, values: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Sort a ``(k, rows)`` hit block by ``(-score, cui, surface)``.
-
-        ``np.lexsort(..., axis=0)`` sorts every column independently, so the
-        whole chunk is ordered in one call instead of one Python ``sorted`` per
-        mention. ``cui`` / ``surface`` are compared as strings, matching the
-        rule documented on :meth:`search`.
-        """
-        flat = indices.ravel().astype(np.int64, copy=False)
-        cuis = np.asarray(
-            [self.cuis[i] for i in flat], dtype=np.str_
-        ).reshape(indices.shape)
-        surfaces = np.asarray(
-            [self.surfaces[i] for i in flat], dtype=np.str_
-        ).reshape(indices.shape)
-        order = np.lexsort(
-            (surfaces, cuis, -np.asarray(values, dtype=np.float64)), axis=0
-        )
-        return (
-            np.take_along_axis(indices, order, axis=0),
-            np.take_along_axis(values, order, axis=0),
-        )
-
-    def _hits(
-        self, indices: np.ndarray, values: np.ndarray
-    ) -> list[list[RetrievalHit]]:
-        """``(k, rows)`` sorted hit arrays -> one hit list per query row."""
-        return [
-            [
-                RetrievalHit(
-                    cui=self.cuis[int(indices[rank, column])],
-                    surface=self.surfaces[int(indices[rank, column])],
-                    score=float(values[rank, column]),
-                    rank=rank + 1,
-                )
-                for rank in range(indices.shape[0])
-            ]
-            for column in range(indices.shape[1])
-        ]
+        return self._search(matrix, top_k, source_kb)
 
     def search(
         self,
@@ -580,11 +514,20 @@ class VectorIndex:
             vector[None, :], top_k, source_kb=source_kb
         )[0]
 
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def _as_numpy_vectors(self) -> np.ndarray:
+        """The vectors as a NumPy array; materialises a disk-backed KB."""
+        if isinstance(self.vectors, np.ndarray):
+            return self.vectors
+        return pc.to_numpy(self.vectors, allow_huge=True)
+
     def save(self, directory) -> None:
         base = Path(directory)
         base.mkdir(parents=True, exist_ok=True)
 
-        np.save(base / "vectors.npy", self.vectors, allow_pickle=False)
+        pc.save_npy(self.vectors, base / "vectors.npy")
         meta = {
             "count": len(self),
             "dim": int(self.vectors.shape[1]),
@@ -617,7 +560,7 @@ class VectorIndex:
         with path.open("wb") as handle:
             np.savez_compressed(
                 handle,
-                vectors=self.vectors,
+                vectors=self._as_numpy_vectors(),
                 cuis=np.asarray(list(self.cuis), dtype=np.str_),
                 surfaces=np.asarray(list(self.surfaces), dtype=np.str_),
                 source_kbs=np.asarray(
@@ -628,8 +571,13 @@ class VectorIndex:
             )
 
     @classmethod
-    def load_npz(cls, path) -> "VectorIndex":
-        """Load an index written by :meth:`save_npz`."""
+    def load_npz(cls, path, *, cache_dir=None) -> "VectorIndex":
+        """Load an index written by :meth:`save_npz`.
+
+        The ``vectors.npy`` member is streamed to ``cache_dir`` (default:
+        ``tempfile.gettempdir()/grf_kb_npy``) and memory-mapped there, so the
+        KB is never decompressed into the Python heap as one array.
+        """
         path = Path(path)
         with np.load(path, allow_pickle=False) as data:
             required = ("vectors", "cuis", "surfaces", "source_kbs", "meta")
@@ -638,7 +586,6 @@ class VectorIndex:
                 raise ValueError(
                     f"{path}: npz artifact is missing keys: {', '.join(missing)}"
                 )
-            vectors = np.asarray(data["vectors"], dtype=np.float32)
             cuis = [str(value) for value in data["cuis"]]
             surfaces = [str(value) for value in data["surfaces"]]
             source_kbs = [str(value) or None for value in data["source_kbs"]]
@@ -647,17 +594,24 @@ class VectorIndex:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}: invalid 'meta' JSON: {exc.msg}") from exc
 
-        if not isinstance(meta, dict):
-            raise ValueError(f"{path}: 'meta' must be a JSON object")
-        if meta.get("format") != SINGLE_FILE_FORMAT:
-            raise ValueError(
-                f"{path}: unsupported artifact format {meta.get('format')!r}; "
-                f"expected {SINGLE_FILE_FORMAT!r}"
-            )
-        if meta.get("count") != len(cuis) or meta.get("count") != vectors.shape[0]:
+            if not isinstance(meta, dict):
+                raise ValueError(f"{path}: 'meta' must be a JSON object")
+            if meta.get("format") != SINGLE_FILE_FORMAT:
+                raise ValueError(
+                    f"{path}: unsupported artifact format {meta.get('format')!r}; "
+                    f"expected {SINGLE_FILE_FORMAT!r}"
+                )
+            if meta.get("count") != len(cuis):
+                raise ValueError(
+                    f"{path}: meta count {meta.get('count')!r} disagrees with "
+                    f"cuis ({len(cuis)})"
+                )
+
+        vectors = pc.load_npy(_extract_vectors(path, cache_dir))
+        if vectors.shape[0] != len(cuis):
             raise ValueError(
                 f"{path}: meta count {meta.get('count')!r} disagrees with "
-                f"vectors/cuis ({vectors.shape[0]}/{len(cuis)})"
+                f"vectors ({vectors.shape[0]})"
             )
         if meta.get("dim") != vectors.shape[1]:
             raise ValueError(
@@ -676,7 +630,7 @@ class VectorIndex:
     @classmethod
     def load(cls, directory) -> "VectorIndex":
         base = Path(directory)
-        vectors = np.load(base / "vectors.npy", allow_pickle=False)
+        vectors = pc.load_npy(base / "vectors.npy")
         with (base / "meta.json").open("r", encoding="utf-8-sig") as handle:
             meta = json.load(handle)
 
@@ -687,8 +641,7 @@ class VectorIndex:
         if missing:
             raise ValueError(f"meta.json is missing keys: {', '.join(missing)}")
 
-        vectors = np.asarray(vectors, dtype=np.float32)
-        if vectors.ndim != 2:
+        if len(vectors.shape) != 2:
             raise ValueError(f"saved vectors must be 2-D, got {vectors.shape!r}")
 
         count = meta["count"]
