@@ -91,12 +91,15 @@ S_{\text{chunk}} &= Q_{\text{chunk}} \cdot A^\top \in \mathbb{R}^{c \times N} \\
 
 ## 5. GPU
 
-`index.use_gpu("cuda")` gọi `pycauset.cuda.enable()`; `pycauset` tự route phép
-nhân sang thiết bị. Không còn bản copy `torch` của toàn bộ KB trong VRAM/RAM —
-ma trận vẫn file-backed, chỉ chunk truy vấn và block điểm đi qua thiết bị.
+`index.use_gpu("cuda")` chấm điểm bằng **CuPy** — `pycauset` là bản CPU, không
+có backend CUDA. Index vẫn là `.npy` memmap trên đĩa: từng **block hàng** được
+copy sang VRAM, `Q · A_blockᵀ` chạy trên GPU, chỉ các entry ≥ ngưỡng k-th của
+block trả về CPU. KB không bao giờ nằm trọn trong VRAM; cỡ block lấy từ VRAM
+trống (`cp.cuda.Device().mem_info`).
 
-Notebook bọc lời gọi trong `try/except RuntimeError` và rơi về CPU nếu bản
-`pycauset` không có CUDA; `index.search_device` cho biết đang chạy ở đâu.
+Notebook bọc lời gọi trong `try/except RuntimeError` và rơi về CPU nếu môi
+trường không có CuPy/CUDA; `index.search_device` cho biết đang chạy ở đâu.
+Chi tiết phép nhân: [matmul](08-matmul.md).
 
 ## 6. Lô hoá
 

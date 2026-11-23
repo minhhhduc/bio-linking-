@@ -217,6 +217,11 @@ class VectorIndex:
         self.source_kbs = source_kbs
         self.encoder_info = encoder_info
         self._device: str | None = None
+        self._gpu_backend: str | None = None
+        # The extracted ``vectors.npy`` behind :attr:`vectors`, when the index
+        # was loaded from an artifact.  The GPU scan streams row blocks from
+        # this file; pycauset matrices cannot be sliced into operands.
+        self._npy_path: Path | None = None
 
     @classmethod
     def from_concepts(
@@ -299,14 +304,14 @@ class VectorIndex:
     # ------------------------------------------------------------------
     @property
     def search_device(self) -> str:
-        """``"cuda"`` when ``pycauset`` is routing matmuls to the GPU."""
+        """``"cuda"`` when the scan runs on the GPU, else ``"cpu"``."""
         return self._device or "cpu"
 
     def use_gpu(self, device: str = "cuda") -> None:
-        """Route ``pycauset.matmul`` to the GPU.
+        """Score on the GPU with CuPy.
 
-        The index stays file-backed: only the query chunk and its score block
-        cross to the device, so enabling CUDA does not copy the KB into VRAM.
+        ``cupy`` runs ``Q · A_blockᵀ`` on index row blocks copied to VRAM;
+        the KB stays memory-mapped on disk and is never copied whole.
         """
         if device == "cpu":
             self.release_gpu()
@@ -315,21 +320,32 @@ class VectorIndex:
             raise ValueError("device must be 'cuda' or 'cpu'")
         if self._device == device:
             return
-        if not pc.cuda.is_available():
+        try:
+            import cupy as cp
+        except ImportError as exc:
             raise RuntimeError(
-                "device='cuda' but this pycauset build has no CUDA backend; "
-                "use the CPU path or install a CUDA-enabled build."
-            )
-        pc.cuda.enable()
+                "device='cuda' needs CuPy; install the build for your CUDA "
+                "runtime (e.g. pip install cupy-cuda12x)"
+            ) from exc
+        try:
+            cp.cuda.runtime.getDeviceCount()
+        except Exception as exc:  # noqa: BLE001 - CuPy raises its own error type
+            raise RuntimeError(
+                "device='cuda' but CuPy sees no CUDA device; use the CPU path"
+            ) from exc
+        cp.get_default_memory_pool().free_all_blocks()
         self._device = device
+        self._gpu_backend = "cupy"
 
     def release_gpu(self) -> None:
-        """Stop routing matmuls to the GPU and release device memory."""
+        """Stop scoring on the GPU and release device memory."""
         self._device = None
+        self._gpu_backend = None
         try:
-            pc.cuda.disable()
-        except Exception:  # noqa: BLE001 - a CPU build has nothing to release
-            pass
+            import cupy as cp
+        except ImportError:
+            return
+        cp.get_default_memory_pool().free_all_blocks()
 
     @staticmethod
     def _validate_top_k(top_k: int) -> None:
@@ -391,6 +407,11 @@ class VectorIndex:
         if candidates == 0:
             return empty
         columns = min(top_k, candidates)
+        if self._device == "cuda":
+            rows, cols, values = self._cupy_candidates(matrix, columns, positions)
+            if rows.size == 0:
+                return empty
+            return self._assemble(rows, cols, values, columns, matrix.shape[0])
         chunk_rows = max(
             1, min(self._QUERY_CHUNK, self._SCORE_BUDGET // count)
         )
@@ -428,6 +449,73 @@ class VectorIndex:
                 )
             )
         return results
+
+    def _cupy_candidates(
+        self,
+        matrix: np.ndarray,
+        columns: int,
+        positions: np.ndarray,
+    ):
+        """GPU scan: index row blocks → VRAM → ``Q·Aᵀ`` with CuPy.
+
+        Block width follows the free VRAM CuPy reports, so neither the KB nor
+        the full score matrix is ever resident.  Returns the entries at or
+        above each block's k-th score, in global index coordinates.
+        """
+        import cupy as cp
+
+        if self._npy_path is not None:
+            source = np.load(self._npy_path, mmap_mode="r")
+        elif isinstance(self.vectors, np.ndarray):
+            source = self.vectors
+        else:
+            source = pc.to_numpy(self.vectors, allow_huge=True)
+        n_rows = int(source.shape[0])
+        dim = int(source.shape[1])
+        n_queries = int(matrix.shape[0])
+        itemsize = np.dtype(np.float32).itemsize
+        # A block costs its vectors, one score column per query, and the mask.
+        free, _ = cp.cuda.Device().mem_info
+        per_row = dim * itemsize + n_queries * (itemsize + 1)
+        block_rows = max(1, int(free) // 3 // per_row)
+        filtered = int(positions.size) != n_rows
+
+        queries = cp.asarray(np.ascontiguousarray(matrix, dtype=np.float32))
+        rows_out: list[np.ndarray] = []
+        cols_out: list[np.ndarray] = []
+        values_out: list[np.ndarray] = []
+        try:
+            for start in range(0, n_rows, block_rows):
+                stop = min(n_rows, start + block_rows)
+                lo = int(np.searchsorted(positions, start, side="left"))
+                hi = int(np.searchsorted(positions, stop, side="left"))
+                if hi <= lo:
+                    continue
+                scores = queries @ cp.asarray(source[start:stop]).T
+                if filtered:
+                    scores = scores[:, cp.asarray(positions[lo:hi] - start)]
+                width = hi - lo
+                kth = min(columns, width)
+                # cp.partition copies, so the block keeps its column order.
+                cutoff = cp.partition(scores, width - kth, axis=1)[
+                    :, width - kth
+                ]
+                rows, cols = cp.nonzero(scores >= cutoff[:, None])
+                rows_out.append(cp.asnumpy(rows))
+                cols_out.append(positions[lo:hi][cp.asnumpy(cols)])
+                values_out.append(cp.asnumpy(scores[rows, cols]))
+                del scores
+        finally:
+            del queries
+            cp.get_default_memory_pool().free_all_blocks()
+        if not rows_out:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty.copy(), np.empty(0, dtype=np.float32)
+        return (
+            np.concatenate(rows_out),
+            np.concatenate(cols_out),
+            np.concatenate(values_out),
+        )
 
     def _assemble(
         self,
@@ -629,7 +717,8 @@ class VectorIndex:
                     f"cuis ({len(cuis)})"
                 )
 
-        vectors = _open_vectors(_extract_vectors(path, cache_dir), cache_dir)
+        extracted = _extract_vectors(path, cache_dir)
+        vectors = _open_vectors(extracted, cache_dir)
         if vectors.shape[0] != len(cuis):
             raise ValueError(
                 f"{path}: meta count {meta.get('count')!r} disagrees with "
@@ -641,13 +730,15 @@ class VectorIndex:
                 f"shape {vectors.shape!r}"
             )
 
-        return cls(
+        index = cls(
             vectors,
             cuis,
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
         )
+        index._npy_path = extracted
+        return index
 
     @classmethod
     def load(cls, directory) -> "VectorIndex":
@@ -694,10 +785,12 @@ class VectorIndex:
                     f"meta.json {name!r} must be a list of length {count}"
                 )
 
-        return cls(
+        index = cls(
             vectors,
             cuis,
             surfaces,
             source_kbs,
             encoder_info=meta.get("encoder_info"),
         )
+        index._npy_path = base / "vectors.npy"
+        return index

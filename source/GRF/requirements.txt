@@ -1,6 +1,9 @@
 numpy>=1.24
 # Exact cosine matmul and the memory-mapped KB (architecture C4).
 pycauset>=0.6.1
+# GPU scan (optional): CuPy built for the local CUDA runtime, e.g.
+#   pip install cupy-cuda12x
+# Without it, VectorIndex.use_gpu() raises and the notebooks stay on CPU.
 # Prompt templates are data (GRF/prompts.yaml), read by GRF/prompts.py.
 pyyaml>=6.0
 # Required only by SentenceTransformerEncoder (BioSyn/SapBERT checkpoints).

@@ -83,6 +83,6 @@ Tài liệu này là **mục lục** của kiến trúc triển khai (implementa
 | [fusion](05-fusion.md) | C6 + §5.2–5.4 + §7.2/7.3/7.6 — vector interpolation và RRF |
 | [reranking](06-reranking.md) | C8 + §8 — pick top-1 và LLM re-ranker |
 | [configuration](07-configuration.md) | §9–11 — tham số, ma trận thực nghiệm, đo lường, điểm mở rộng |
-| [matmul](08-matmul.md) | C4 — phép nhân `R = Q·Aᵀ`: vì sao `pycauset.matmul`, chunk query, top-k trên block |
+| [matmul](08-matmul.md) | C4 — phép nhân `R = Q·Aᵀ`: `pycauset` trên CPU, CuPy theo block trên GPU, top-k trên block |
 
 Bố cục file trên đĩa (artifact, output) xem [`../storage-layout.md`](../storage-layout.md).
