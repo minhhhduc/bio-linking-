@@ -163,7 +163,7 @@ class VectorIndex:
         # already L2-normalised (the writer normalised it once), so it must not
         # be copied through a NumPy array — that would put the whole KB in RAM.
         if isinstance(vectors, np.ndarray):
-            array = np.array(vectors, dtype=np.float32, copy=True)
+            array = np.array(vectors, dtype=np.float32, copy=True, order="C")
         else:
             array = vectors
         if len(array.shape) != 2:
@@ -673,7 +673,7 @@ class VectorIndex:
         base = Path(directory)
         base.mkdir(parents=True, exist_ok=True)
 
-        pc.save_npy(self.vectors, base / "vectors.npy")
+        np.save(base / "vectors.npy", self._as_numpy_vectors())
         meta = {
             "count": len(self),
             "dim": int(self.vectors.shape[1]),
