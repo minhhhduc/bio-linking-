@@ -17,8 +17,8 @@ COMMON_DIR/
 │   │       ├── grf/
 │   │       │     ├── ranking.ipynb
 │   │       │     └── reranking.ipynb
-│   │       └── {OTHER_METHOD}
-│   ├── buid_kb.ipynb
+│   │       ├── {OTHER_METHOD}
+│   │       └── buid_kb.ipynb
 │   └── common/...
 └── output/
     └── {ENCODER_NAME}/
