@@ -15,8 +15,10 @@ COMMON_DIR/
 |   |       │   ├── ranking.ipynb
 │   │       │   └── reranking.ipynb
 │   │       ├── grf/
-│   │       │     ├── ranking.ipynb
-│   │       │     └── reranking.ipynb
+|   |       |   └── {FEEDBACK_NAME}
+|   |       |       ├── feedback.ipynb
+│   │       │       ├── ranking.ipynb
+│   │       │       └── reranking.ipynb
 │   │       ├── {OTHER_METHOD}
 │   │       └── buid_kb.ipynb
 │   └── common/...
@@ -27,20 +29,22 @@ COMMON_DIR/
             |    ├── baseline/
             |    │   └── baseline_candidates.jsonl
             |    ├── grf/
-            |    │   ├── grf_feedback_bundle.jsonl
-            |    │   ├── grf_feedback.jsonl
-            |    │   ├── candidates/
-            |    │   │   └── grf_<scenario>_n{N_SYN}_k{TOP_K_CONCEPT}_candidates.jsonl
-            |    │   └── grf_retrieval_summary.json
+            |    |   └── {FEEDBACK_NAME}
+            |    │      ├── grf_feedback_bundle.jsonl
+            |    │      ├── grf_feedback.jsonl
+            |    │      └── candidates/
+            |    │          ├── grf_<scenario>_n{N_SYN}_k{TOP_K_CONCEPT}_candidates.jsonl
+            |    │          └── grf_retrieval_summary.json
             |    └── {OTHER_METHOD}
             └── reranking/
                 └── {RERANKER_NAME}/
                     ├── baseline/
                     │   └── baseline_e2e_results.json
                     └── grf/
-                        ├── e2e_results/
-                        │   └── grf_<scenario>_n{N_SYN}_k{TOP_K_CONCEPT}_e2e.json
-                        └── grf_e2e_summary.json
+                        └── {FEEDBACK_NAME}
+                            ├── e2e_results/
+                            │   └── grf_<scenario>_n{N_SYN}_k{TOP_K_CONCEPT}_e2e.json
+                            └── grf_e2e_summary.json
 ```
 
 ```text
