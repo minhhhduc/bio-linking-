@@ -32,9 +32,9 @@ COMMON_DIR/
             |    |   └── {FEEDBACK_NAME}
             |    │      ├── grf_feedback_bundle.jsonl
             |    │      ├── grf_feedback.jsonl
-            |    │      └── candidates/
-            |    │          ├── grf_<scenario>_n{N_SYN}_k{TOP_K_CONCEPT}_candidates.jsonl
-            |    │          └── grf_retrieval_summary.json
+            |    │      ├── candidates/
+            |    │      |   └── grf_<scenario>_n{N_SYN}_k{TOP_K_CONCEPT}_candidates.jsonl
+            |    │      └── grf_retrieval_summary.json
             |    └── {OTHER_METHOD}
             └── reranking/
                 └── {RERANKER_NAME}/
